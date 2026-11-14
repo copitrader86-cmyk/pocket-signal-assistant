@@ -20,7 +20,6 @@ jobs:
       ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.RELEASE_STORE_PASSWORD }}
       ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.RELEASE_KEY_ALIAS }}
       ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
-      ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/pocket-signal-release.jks
 
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +68,8 @@ jobs:
       - name: Validate release configuration
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
+        env:
+          ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/pocket-signal-release.jks
         run: |
           set -euo pipefail
           [[ "$SERVER_BASE_URL" == https://* ]] || {
@@ -83,6 +84,8 @@ jobs:
 
       - name: Build signed release APK
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/pocket-signal-release.jks
         run: |
           ./gradlew --no-daemon --no-watch-fs --max-workers=2 \
             lintDebug testDebugUnitTest \
