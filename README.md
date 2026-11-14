@@ -40,6 +40,13 @@ disk or paid plan. `DATABASE_PATH` points to
 non-root application user, and the backend initializes a new SQLite database
 and schema at startup if none exists.
 
+Set `TWELVE_DATA_API_KEY` in the existing Render web service's Environment
+settings. The Blueprint declares it as a secret prompt
+(`sync: false`); its value is not stored in this repository. After saving the
+environment variable, Render restarts the service, which refreshes the
+Twelve Data Forex catalog at startup. Do not put the key in `render.yaml`,
+the Android app, or source control. Enter it only in the Render dashboard.
+
 Render Free has an ephemeral filesystem. SQLite data, including downloaded
 HistData candles and sync cursors, can be lost when the service restarts,
 redeploys, or spins down. The local development database is not copied to
@@ -102,14 +109,22 @@ users. Twelve Data currently lists a no-cost Basic tier with real-time Forex,
 still requires an account/API key, is quota-limited, and availability and
 permitted use are governed by the provider's terms. Without a configured key,
 the adapter stays unavailable and the app must not produce directional signals.
-Refresh the provider's Forex catalog with
-`POST /api/v1/provider/twelvedata/catalog`, then request up to 5,000 provider
-historical candles with
-`POST /api/v1/history/twelvedata?symbol=EUR%2FUSD&interval_seconds=60`.
+The backend refreshes its Forex catalog at startup and operators can also
+trigger a refresh with `POST /api/v1/provider/twelvedata/catalog`. Historical
+OHLC candles are available for supported intervals through
+`POST /api/v1/history/twelvedata?symbol=EUR%2FUSD&interval_seconds=60`; the
+Android Market Chart screen requests them for the selected pair and timeframe.
 Twelve Data's WebSocket price endpoint is relayed at
 `/api/v1/stream?symbol=EUR%2FUSD`. It records provider ticks and forms 1-second
-and 1-minute live candles. Provider plan limits, permitted instruments, and
-latency still apply; the app never labels these prices as Pocket Option quotes.
+and 1-minute live candles; the chart also updates its selected-timeframe candle
+from the real-time tick stream. Provider plan limits, permitted instruments,
+and latency still apply; provider quota errors are reported as HTTP 429. Check
+`GET /api/v1/sources/status` for `online.credentials_configured` and
+`online.connection_status` (`not_configured`, `configured_no_recent_quote`, or
+`receiving_quotes`). This status reports only whether the backend has a
+configured key and recent stream data; it never returns the key or makes an
+extra provider request. The app never labels these prices as Pocket Option
+quotes.
 
 ### Dukascopy historical data (TESTING preparation)
 

@@ -50,6 +50,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -92,6 +93,7 @@ private val Mint = Color(0xFF30D9A2)
 private val Rose = Color(0xFFFF647C)
 private val Gold = Color(0xFFFFCA72)
 private val Expirations = listOf(3, 5, 10, 15, 20, 25, 30, 60, 120, 180, 240, 300, 600, 900)
+private val ChartIntervals = listOf(60, 300, 900, 1800, 3600, 14400, 86400)
 
 private data class Instrument(
     val provider: String,
@@ -429,6 +431,20 @@ private object Api {
         return json.toCandles()
     }
 
+    suspend fun historicalCandles(symbol: String, intervalSeconds: Int): List<Candle> {
+        val encoded = URLEncoder.encode(symbol, Charsets.UTF_8.name())
+        request(
+            "/api/v1/history/twelvedata?symbol=$encoded" +
+                "&interval_seconds=$intervalSeconds&outputsize=300",
+            method = "POST",
+        )
+        val json = request(
+            "/api/v1/candles?provider=TwelveData&symbol=$encoded" +
+                "&interval_seconds=$intervalSeconds&data_kind=HISTORICAL&limit=500",
+        ).getJSONArray("candles")
+        return json.toCandles()
+    }
+
     suspend fun allHistory(): List<TradeRecord> = withContext(Dispatchers.IO) {
         val request = Request.Builder().url("$base/api/v1/signals").build()
         http.newCall(request).execute().use { response ->
@@ -554,7 +570,7 @@ private fun JSONArray.toRecords(): List<TradeRecord> =
         )
     }
 
-private enum class Page { HOME, ANALYSIS, HISTORY, STATISTICS, TESTING }
+private enum class Page { HOME, MARKET_CHART, ANALYSIS, HISTORY, STATISTICS, TESTING }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -705,6 +721,7 @@ private fun PocketSignalApp() {
                             failure = { error = it; busy = false },
                         ) { Api.allHistory() }
                     },
+                    onMarketChart = { page = Page.MARKET_CHART },
                     onStatistics = {
                         busy = true
                         runAsync(scope,
@@ -713,6 +730,12 @@ private fun PocketSignalApp() {
                         ) { Api.statistics(statsPeriod, sessionId) }
                     },
                     onTesting = { page = Page.TESTING },
+                )
+                Page.MARKET_CHART -> MarketChartScreen(
+                    instruments = instruments,
+                    selected = selected,
+                    onSelect = { selected = it },
+                    onBack = { page = Page.HOME },
                 )
                 Page.ANALYSIS -> AnalysisScreen(
                     signal = signal,
@@ -791,6 +814,7 @@ private fun HomeScreen(
     onSession: () -> Unit,
     onSignal: () -> Unit,
     onHistory: () -> Unit,
+    onMarketChart: () -> Unit,
     onStatistics: () -> Unit,
     onTesting: () -> Unit,
 ) {
@@ -949,6 +973,14 @@ private fun HomeScreen(
             OutlinedButton(onClick = onStatistics, enabled = !busy, modifier = Modifier.weight(1f)) {
                 Text("STATISTICS")
             }
+        }
+        OutlinedButton(
+            onClick = onMarketChart,
+            enabled = selected != null,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Mint),
+        ) {
+            Text("ГРАФИК РЫНКА • СВЕЧИ")
         }
         OutlinedButton(
             onClick = onTesting,
@@ -1414,6 +1446,226 @@ private fun TestingScreen(onBack: () -> Unit) {
 }
 
 @Composable
+private fun MarketChartScreen(
+    instruments: List<Instrument>,
+    selected: Instrument?,
+    onSelect: (Instrument) -> Unit,
+    onBack: () -> Unit,
+) {
+    val mainThread = remember { Handler(Looper.getMainLooper()) }
+    var intervalSeconds by remember { mutableIntStateOf(60) }
+    var candles by remember { mutableStateOf<List<Candle>>(emptyList()) }
+    var loadingHistory by remember { mutableStateOf(false) }
+    var historyError by remember { mutableStateOf<String?>(null) }
+    var streamError by remember { mutableStateOf<String?>(null) }
+    var latestPrice by remember { mutableStateOf<Double?>(null) }
+    var latestTick by remember { mutableStateOf<Pair<Long, Double>?>(null) }
+    var reconnectAttempt by remember { mutableIntStateOf(0) }
+    var reconnectTrigger by remember { mutableIntStateOf(0) }
+    val activeIntervalSeconds by rememberUpdatedState(intervalSeconds)
+    val activeCandles by rememberUpdatedState(candles)
+    val activeLoadingHistory by rememberUpdatedState(loadingHistory)
+    val symbol = selected?.symbol
+
+    LaunchedEffect(symbol, intervalSeconds) {
+        if (symbol == null) return@LaunchedEffect
+        candles = emptyList()
+        latestPrice = null
+        latestTick = null
+        loadingHistory = true
+        historyError = null
+        try {
+            val history = Api.historicalCandles(symbol, intervalSeconds)
+            candles = latestTick?.let { (timestamp, price) ->
+                history.withLiveTick(timestamp, price, intervalSeconds)
+            } ?: history
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            historyError = failure.message ?: "Не удалось загрузить свечи"
+        } finally {
+            loadingHistory = false
+        }
+    }
+
+    DisposableEffect(symbol, reconnectTrigger) {
+        if (symbol == null) {
+            onDispose { }
+        } else {
+            var disposed = false
+            var retry: Runnable? = null
+            var stableConnection: Runnable? = null
+            val socket = Api.openStream(
+                symbol,
+                onConnected = {
+                    mainThread.post {
+                        streamError = null
+                        retry?.let(mainThread::removeCallbacks)
+                        retry = null
+                        stableConnection?.let(mainThread::removeCallbacks)
+                        val resetAttempts = Runnable { reconnectAttempt = 0 }
+                        stableConnection = resetAttempts
+                        mainThread.postDelayed(resetAttempts, 10_000L)
+                    }
+                },
+                onTick = { price, timestamp ->
+                    mainThread.post {
+                        latestPrice = price
+                        latestTick = timestamp to price
+                        if (!activeLoadingHistory) {
+                            candles = activeCandles.withLiveTick(
+                                timestamp,
+                                price,
+                                activeIntervalSeconds,
+                            )
+                        }
+                    }
+                },
+                onError = { message ->
+                    mainThread.post {
+                        if (disposed) return@post
+                        streamError = message
+                        stableConnection?.let(mainThread::removeCallbacks)
+                        if (retry == null) {
+                            val retryDelay = (1_000L * (1L shl reconnectAttempt.coerceIn(0, 5)))
+                                .coerceAtMost(30_000L)
+                            val next = Runnable {
+                                retry = null
+                                reconnectAttempt += 1
+                                reconnectTrigger += 1
+                            }
+                            retry = next
+                            mainThread.postDelayed(next, retryDelay)
+                        }
+                    }
+                },
+            )
+            onDispose {
+                disposed = true
+                retry?.let(mainThread::removeCallbacks)
+                stableConnection?.let(mainThread::removeCallbacks)
+                socket.close(1000, "Market chart closed")
+            }
+        }
+    }
+
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onBack) { Text("НАЗАД") }
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text("РЫНОЧНЫЙ ГРАФИК", fontWeight = FontWeight.Black, fontSize = 17.sp)
+                Text("TWELVE DATA • OHLC", color = Muted, fontSize = 10.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            Text(
+                latestPrice?.let { "%.5f".format(Locale.US, it) } ?: "—",
+                color = Mint,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SelectionMenu(
+                label = "ВАЛЮТНАЯ ПАРА",
+                value = selected?.symbol ?: "Нет доступных пар",
+                items = instruments.map { it.symbol },
+                onSelected = { name ->
+                    instruments.firstOrNull { it.symbol == name }?.let(onSelect)
+                },
+                modifier = Modifier.weight(1.2f),
+                enabled = instruments.isNotEmpty(),
+            )
+            SelectionMenu(
+                label = "ТАЙМФРЕЙМ",
+                value = formatChartInterval(intervalSeconds),
+                items = ChartIntervals.map(::formatChartInterval),
+                onSelected = { value ->
+                    ChartIntervals.firstOrNull { formatChartInterval(it) == value }
+                        ?.let { intervalSeconds = it }
+                },
+                modifier = Modifier.weight(0.8f),
+                enabled = true,
+            )
+        }
+
+        Card(
+            Modifier.fillMaxWidth().weight(1f),
+            colors = CardDefaults.cardColors(containerColor = Panel),
+            shape = RoundedCornerShape(18.dp),
+        ) {
+            when {
+                loadingHistory && candles.isEmpty() -> Box(
+                    Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(color = Mint)
+                }
+                candles.isNotEmpty() -> CandleChart(
+                    candles,
+                    Modifier.fillMaxSize().padding(10.dp),
+                )
+                else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        historyError ?: "Нет доступных исторических свечей",
+                        color = if (historyError == null) Muted else Rose,
+                    )
+                }
+            }
+        }
+
+        Text(
+            when {
+                streamError != null -> "LIVE недоступен: $streamError"
+                latestPrice != null -> "LIVE • Последний тик обновляет текущую свечу"
+                else -> "Ожидание реальных котировок WebSocket…"
+            },
+            color = if (streamError == null) Muted else Rose,
+            fontSize = 11.sp,
+        )
+        if (historyError != null && candles.isNotEmpty()) {
+            Text(historyError!!, color = Rose, fontSize = 11.sp)
+        }
+    }
+}
+
+private fun formatChartInterval(intervalSeconds: Int): String = when (intervalSeconds) {
+    60 -> "1 мин"
+    300 -> "5 мин"
+    900 -> "15 мин"
+    1800 -> "30 мин"
+    3600 -> "1 час"
+    14400 -> "4 часа"
+    86400 -> "1 день"
+    else -> "$intervalSeconds сек"
+}
+
+private fun List<Candle>.withLiveTick(
+    timestampMs: Long,
+    price: Double,
+    intervalSeconds: Int,
+): List<Candle> {
+    val bucketMs = intervalSeconds * 1000L
+    val candleTimestamp = timestampMs / bucketMs * bucketMs
+    val index = indexOfLast { it.timestamp == candleTimestamp }
+    if (index >= 0) {
+        return toMutableList().also { updated ->
+            val candle = updated[index]
+            updated[index] = candle.copy(
+                high = max(candle.high, price),
+                low = minOf(candle.low, price),
+                close = price,
+            )
+        }
+    }
+    if (lastOrNull()?.timestamp?.let { it > candleTimestamp } == true) return this
+    return (takeLast(499) + Candle(candleTimestamp, price, price, price, price))
+}
+
+@Composable
 private fun AnalysisScreen(
     signal: Signal?,
     serverClockOffsetMs: Long,
@@ -1463,6 +1715,8 @@ private fun AnalysisScreen(
             onConnected = {
                 mainThread.post {
                     streamError = null
+                    retry?.let(mainThread::removeCallbacks)
+                    retry = null
                     stableConnection?.let(mainThread::removeCallbacks)
                     val resetAttempts = Runnable { reconnectAttempt = 0 }
                     stableConnection = resetAttempts
@@ -1494,6 +1748,7 @@ private fun AnalysisScreen(
                         val retryDelay = (1_000L * (1L shl reconnectAttempt.coerceIn(0, 5)))
                             .coerceAtMost(30_000L)
                         val next = Runnable {
+                            retry = null
                             reconnectAttempt += 1
                             reconnectTrigger += 1
                         }

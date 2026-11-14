@@ -23,7 +23,9 @@ INTERVALS_BY_SECONDS = {
 
 
 class MarketDataError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
@@ -88,18 +90,34 @@ class TwelveDataClient:
                 f"{PROVIDER_BASE_URL}/{endpoint}",
                 params={"apikey": self.api_key, **params},
             )
-            response.raise_for_status()
+        except httpx.HTTPError:
+            raise MarketDataError("Twelve Data request failed") from None
+        if response.status_code == 429:
+            raise MarketDataError(
+                "Twelve Data rate limit exceeded", status_code=429
+            )
+        if response.is_error:
+            raise MarketDataError(
+                "Twelve Data request failed", status_code=response.status_code
+            )
+        try:
             payload = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            raise MarketDataError("Twelve Data request failed") from error
+        except ValueError:
+            raise MarketDataError("Twelve Data returned an invalid response") from None
 
         if not isinstance(payload, dict):
             raise MarketDataError("Twelve Data returned an invalid response")
         if payload.get("status") == "error" or (
             "code" in payload and "message" in payload
         ):
-            message = str(payload.get("message", "Provider rejected the request"))
-            raise MarketDataError(message)
+            provider_code = payload.get("code")
+            rate_limited = str(provider_code) == "429"
+            raise MarketDataError(
+                "Twelve Data rate limit exceeded"
+                if rate_limited
+                else "Twelve Data rejected the request",
+                status_code=429 if rate_limited else 502,
+            )
         return payload
 
     async def forex_pairs(self) -> list[dict[str, str]]:

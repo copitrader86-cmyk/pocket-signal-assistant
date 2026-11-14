@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import httpx
+from starlette.websockets import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from app.database import connect, initialize_database
@@ -183,6 +184,211 @@ def test_twelvedata_missing_key_fails_explicitly() -> None:
 
     with pytest.raises(MarketDataError, match="not configured"):
         asyncio.run(fetch())
+
+
+def test_twelvedata_forex_pairs_are_loaded_from_provider_catalog() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/forex_pairs")
+        assert request.url.params["apikey"] == "test-key"
+        return httpx.Response(
+            200,
+            json={"data": [{"symbol": "EUR/USD"}, {"symbol": "GBP/USD"}]},
+        )
+
+    async def fetch() -> list[dict[str, str]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with TwelveDataClient("test-key", client=client) as provider:
+                return await provider.forex_pairs()
+
+    instruments = asyncio.run(fetch())
+
+    assert [instrument["symbol"] for instrument in instruments] == [
+        "EUR/USD",
+        "GBP/USD",
+    ]
+    assert all(instrument["market_type"] == "CLASSIC" for instrument in instruments)
+
+
+def test_twelvedata_rate_limit_is_reported_without_provider_details(
+    tmp_path: Path,
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "error",
+                "code": 429,
+                "message": "API credits exhausted",
+            },
+        )
+
+    async def fetch() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with TwelveDataClient("test-key", client=client) as provider:
+                await provider.forex_pairs()
+
+    with pytest.raises(MarketDataError, match="rate limit") as error:
+        asyncio.run(fetch())
+    assert error.value.status_code == 429
+    assert "test-key" not in str(error.value)
+
+
+def test_twelvedata_catalog_route_preserves_provider_rate_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RateLimitedTwelveDataClient:
+        async def __aenter__(self) -> "RateLimitedTwelveDataClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def forex_pairs(self) -> list[dict[str, str]]:
+            raise MarketDataError("Twelve Data rate limit exceeded", status_code=429)
+
+    monkeypatch.setattr("app.main.TwelveDataClient", RateLimitedTwelveDataClient)
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.post("/api/v1/provider/twelvedata/catalog")
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Twelve Data rate limit exceeded"
+
+
+def test_twelvedata_status_reports_missing_key_without_exposing_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
+
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.get("/api/v1/sources/status")
+
+    assert response.status_code == 200
+    online = response.json()["online"]
+    assert online["credentials_configured"] is False
+    assert online["connection_status"] == "not_configured"
+    assert "api_key" not in online
+
+
+def test_twelvedata_status_reports_configured_key_without_returning_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "local-test-secret"
+    monkeypatch.setenv("TWELVE_DATA_API_KEY", secret)
+
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.get("/api/v1/sources/status")
+
+    assert response.status_code == 200
+    online = response.json()["online"]
+    assert online["credentials_configured"] is True
+    assert online["connection_status"] == "configured_no_recent_quote"
+    assert secret not in response.text
+
+
+def test_twelvedata_websocket_stream_persists_provider_quotes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO market_instruments (
+                provider, market_type, symbol, display_name, updated_at_ms
+            ) VALUES ('TwelveData', 'CLASSIC', 'EUR/USD', 'EUR/USD', 1)
+            """
+        )
+    api_key = "websocket-test-secret"
+    monkeypatch.setenv("TWELVE_DATA_API_KEY", api_key)
+
+    class FakeUpstream:
+        def __init__(self) -> None:
+            self.sent_tick = False
+
+        async def __aenter__(self) -> "FakeUpstream":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def send(self, message: str) -> None:
+            assert json.loads(message) == {
+                "action": "subscribe",
+                "params": {"symbols": "EUR/USD"},
+            }
+
+        async def recv(self) -> str:
+            if not self.sent_tick:
+                self.sent_tick = True
+                return json.dumps(
+                    {
+                        "event": "price",
+                        "symbol": "EUR/USD",
+                        "price": "1.1",
+                        "timestamp": 1735689600,
+                    }
+                )
+            raise WebSocketDisconnect(code=1000)
+
+    def fake_connect(url: str, **kwargs: object) -> FakeUpstream:
+        assert url == "wss://ws.twelvedata.com/v1/quotes/price"
+        assert kwargs["additional_headers"] == {"X-TD-APIKEY": api_key}
+        return FakeUpstream()
+
+    monkeypatch.setattr("app.main.websockets.connect", fake_connect)
+    with TestClient(create_app(database_path)) as client:
+        with client.websocket_connect("/api/v1/stream?symbol=EUR%2FUSD") as socket:
+            tick = socket.receive_json()
+        candles = client.get(
+            "/api/v1/candles",
+            params={
+                "provider": "TwelveData",
+                "symbol": "EUR/USD",
+                "interval_seconds": 1,
+                "data_kind": "LIVE",
+            },
+        )
+
+    assert tick["event"] == "price"
+    assert candles.status_code == 200
+    assert candles.json()["candles"][0]["close"] == 1.1
+
+
+def test_twelvedata_catalog_refresh_saves_provider_instruments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeTwelveDataClient:
+        async def __aenter__(self) -> "FakeTwelveDataClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def forex_pairs(self) -> list[dict[str, str]]:
+            return [
+                {
+                    "provider": "TwelveData",
+                    "market_type": "CLASSIC",
+                    "symbol": "EUR/USD",
+                    "display_name": "EUR/USD",
+                }
+            ]
+
+    monkeypatch.setattr("app.main.TwelveDataClient", FakeTwelveDataClient)
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        refreshed = client.post("/api/v1/provider/twelvedata/catalog")
+        catalog = client.get("/api/v1/catalog")
+
+    assert refreshed.status_code == 200
+    assert refreshed.json()["instruments_updated"] == 1
+    assert catalog.json()["instruments"] == [
+        {
+            "provider": "TwelveData",
+            "market_type": "CLASSIC",
+            "symbol": "EUR/USD",
+            "display_name": "EUR/USD",
+        }
+    ]
 
 
 def test_twelvedata_history_api_persists_provider_candles(

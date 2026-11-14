@@ -578,7 +578,52 @@ class SessionRequest(BaseModel):
 def _provider_http_error(error: MarketDataError) -> HTTPException:
     if "not configured" in str(error):
         return HTTPException(status_code=503, detail=str(error))
+    if error.status_code == 429:
+        return HTTPException(status_code=429, detail="Twelve Data rate limit exceeded")
     return HTTPException(status_code=502, detail=f"Market-data provider error: {error}")
+
+
+async def _refresh_twelvedata_catalog(database_path: Path) -> int:
+    async with TwelveDataClient() as provider:
+        instruments = await provider.forex_pairs()
+    if not instruments:
+        raise MarketDataError("Twelve Data returned an empty Forex catalog")
+
+    updated_at_ms = int(time.time() * 1000)
+    connection = connect(database_path)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM market_instruments WHERE provider = ? AND market_type = 'CLASSIC'",
+                (PROVIDER_NAME,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO market_instruments (
+                    provider, market_type, symbol, display_name, updated_at_ms
+                ) VALUES (?, 'CLASSIC', ?, ?, ?)
+                """,
+                [
+                    (
+                        instrument["provider"],
+                        instrument["symbol"],
+                        instrument["display_name"],
+                        updated_at_ms,
+                    )
+                    for instrument in instruments
+                ],
+            )
+    finally:
+        connection.close()
+    return len(instruments)
+
+
+async def _sync_twelvedata_catalog(database_path: Path) -> None:
+    try:
+        instruments_updated = await _refresh_twelvedata_catalog(database_path)
+        logger.info("Twelve Data Forex catalog refreshed: %s instruments", instruments_updated)
+    except (MarketDataError, sqlite3.Error):
+        logger.warning("Twelve Data Forex catalog refresh failed")
 
 
 def create_app(database_path: Path | None = None) -> FastAPI:
@@ -608,6 +653,13 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             if automatic_sync
             else []
         )
+        if automatic_sync and os.getenv("TWELVE_DATA_API_KEY"):
+            sync_tasks.append(
+                asyncio.create_task(
+                    _sync_twelvedata_catalog(resolved_database_path),
+                    name="twelvedata-catalog-sync",
+                )
+            )
         try:
             yield
         finally:
@@ -941,6 +993,13 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             else None
         )
         online_ready = bool(key_configured and age_ms is not None and age_ms <= 2000)
+        connection_status = (
+            "not_configured"
+            if not key_configured
+            else "receiving_quotes"
+            if online_ready
+            else "configured_no_recent_quote"
+        )
         reference_latest = connection.execute(
             """
             SELECT MAX(rate_date) AS last_date, MAX(retrieved_at_ms) AS retrieved_at_ms,
@@ -1024,6 +1083,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 else "not_configured"
                 if not key_configured
                 else "stale_or_unavailable",
+                "credentials_configured": key_configured,
+                "connection_status": connection_status,
                 "ready": online_ready,
                 "reason": None
                 if online_ready
@@ -1123,43 +1184,21 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         }
 
     @application.post("/api/v1/provider/twelvedata/catalog")
-    async def refresh_twelvedata_catalog(
-        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
-    ) -> dict[str, int | str]:
+    async def refresh_twelvedata_catalog() -> dict[str, int | str]:
         try:
-            async with TwelveDataClient() as provider:
-                instruments = await provider.forex_pairs()
+            instruments_updated = await _refresh_twelvedata_catalog(
+                resolved_database_path
+            )
         except MarketDataError as error:
             raise _provider_http_error(error) from error
-        if not instruments:
+        except sqlite3.Error as error:
             raise HTTPException(
-                status_code=502,
-                detail="Twelve Data returned an empty Forex catalog; existing catalog was preserved",
-            )
-
-        updated_at_ms = int(time.time() * 1000)
-        with connection:
-            connection.execute(
-                "DELETE FROM market_instruments WHERE provider = ? AND market_type = 'CLASSIC'",
-                (PROVIDER_NAME,),
-            )
-            cursor = connection.executemany(
-                """
-                INSERT INTO market_instruments (
-                    provider, market_type, symbol, display_name, updated_at_ms
-                ) VALUES (?, 'CLASSIC', ?, ?, ?)
-                """,
-                [
-                    (
-                        instrument["provider"],
-                        instrument["symbol"],
-                        instrument["display_name"],
-                        updated_at_ms,
-                    )
-                    for instrument in instruments
-                ],
-            )
-        return {"provider": PROVIDER_NAME, "instruments_updated": len(instruments)}
+                status_code=503, detail="Could not save the Twelve Data catalog"
+            ) from error
+        return {
+            "provider": PROVIDER_NAME,
+            "instruments_updated": instruments_updated,
+        }
 
     @application.get("/api/v1/candles", response_model=CandleSeriesResponse)
     def candles(

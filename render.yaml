@@ -12,3 +12,5 @@ services:
         value: /tmp/pocket-signal/signals.db
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: TWELVE_DATA_API_KEY
+        sync: false
