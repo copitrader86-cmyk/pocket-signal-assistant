@@ -6,11 +6,16 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val defaultServerBaseUrl = "https://pocket-signal-assistant.onrender.com"
+val serverBaseUrl = providers.gradleProperty("serverBaseUrl")
+    .orElse(providers.environmentVariable("SERVER_BASE_URL"))
+    .orElse(defaultServerBaseUrl)
+    .get()
 val apiBaseUrl = providers.gradleProperty("apiBaseUrl")
-    .orElse("http://10.0.2.2:8000")
+    .orElse(serverBaseUrl)
     .get()
 val releaseApiBaseUrl = providers.gradleProperty("releaseApiBaseUrl")
-    .orElse("")
+    .orElse(serverBaseUrl)
     .get()
 val releaseStoreFile = providers.gradleProperty("releaseStoreFile").orNull
 val releaseStorePassword = providers.gradleProperty("releaseStorePassword").orNull

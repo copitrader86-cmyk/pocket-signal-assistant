@@ -1,10 +1,13 @@
+import asyncio
 import os
 import sqlite3
 import json
+import logging
 import math
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date as Date, datetime, time as DateTime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Iterator
 
@@ -15,7 +18,25 @@ from pydantic import BaseModel, Field
 from app.analytics import analyze_candles
 from app.backtesting import BacktestError, run_backtest
 from app.database import connect, initialize_database
-from app.historical_import import MAX_CSV_BYTES, import_historical_csv
+from app.dukascopy import (
+    MAX_HOURS_PER_REQUEST,
+    DukascopyClient,
+    HistoricalBatch,
+    INSTRUMENTS as DUKASCOPY_INSTRUMENTS,
+)
+from app.dukascopy import PROVIDER_NAME as DUKASCOPY_PROVIDER
+from app.historical_import import (
+    MAX_CSV_BYTES,
+    import_historical_csv,
+    save_historical_candles,
+    save_historical_ticks,
+)
+from app.histdata import (
+    PROVIDER_NAME as HISTDATA_PROVIDER,
+    SOURCE_RESOLUTION_MS as HISTDATA_RESOLUTION_MS,
+    HistDataClient,
+    HistDataBatch,
+)
 from app.learning import evaluate_artifact, predict_win_probability, train_model
 from app.market_data import (
     Candle,
@@ -25,6 +46,439 @@ from app.market_data import (
     TwelveDataClient,
     normalize_symbol,
 )
+from app.reference_data import (
+    EARLIEST_DATE as REFERENCE_EARLIEST_DATE,
+    PROVIDER_NAME as REFERENCE_PROVIDER,
+    SUPPORTED_PAIRS as REFERENCE_PAIRS,
+    FrankfurterClient,
+    save_reference_rates,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def _set_reference_sync_status(
+    database_path: Path,
+    symbol: str,
+    status: str,
+    *,
+    provider: str = REFERENCE_PROVIDER,
+    error_message: str | None = None,
+    successful: bool = False,
+    scanned_until_ms: int | None = None,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    connection = connect(database_path)
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO public_history_sync (
+                    provider, symbol, status, started_at_ms, updated_at_ms,
+                    last_success_at_ms, error_message, last_scanned_timestamp_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (provider, symbol) DO UPDATE SET
+                    status = excluded.status,
+                    started_at_ms = CASE
+                        WHEN excluded.status = 'loading' THEN excluded.started_at_ms
+                        ELSE public_history_sync.started_at_ms
+                    END,
+                    updated_at_ms = excluded.updated_at_ms,
+                    last_success_at_ms = COALESCE(
+                        excluded.last_success_at_ms,
+                        public_history_sync.last_success_at_ms
+                    ),
+                    error_message = excluded.error_message,
+                    last_scanned_timestamp_ms = COALESCE(
+                        excluded.last_scanned_timestamp_ms,
+                        public_history_sync.last_scanned_timestamp_ms
+                    )
+                """,
+                (
+                    provider,
+                    symbol,
+                    status,
+                    now_ms if status == "loading" else None,
+                    now_ms,
+                    now_ms if successful else None,
+                    error_message,
+                    scanned_until_ms,
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def _persist_dukascopy_batch(
+    database_path: Path,
+    batch: HistoricalBatch,
+    *,
+    interval_seconds: int,
+) -> tuple[int, int]:
+    if not batch.candles and not batch.ticks:
+        return 0, 0
+    connection = connect(database_path)
+    try:
+        with connection:
+            candles_inserted = save_historical_candles(
+                connection,
+                batch.candles,
+                provider=DUKASCOPY_PROVIDER,
+                symbol=batch.symbol,
+                interval_seconds=interval_seconds,
+                source_resolution_ms=1,
+            )
+            ticks_inserted = save_historical_ticks(
+                connection,
+                batch.ticks,
+                symbol=batch.symbol,
+            )
+            connection.execute(
+                """
+                INSERT INTO market_instruments (
+                    provider, market_type, symbol, display_name, updated_at_ms
+                ) VALUES (?, 'CLASSIC', ?, ?, ?)
+                ON CONFLICT (provider, market_type, symbol) DO NOTHING
+                """,
+                (
+                    DUKASCOPY_PROVIDER,
+                    batch.symbol,
+                    batch.symbol,
+                    int(time.time() * 1000),
+                ),
+            )
+        return candles_inserted, ticks_inserted
+    finally:
+        connection.close()
+
+
+def _persist_histdata_batch(database_path: Path, batch: HistDataBatch) -> int:
+    if not batch.candles:
+        return 0
+    year_start = int(
+        datetime(batch.year, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
+        .astimezone(timezone.utc)
+        .timestamp()
+        * 1000
+    )
+    next_year_start = int(
+        datetime(batch.year + 1, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
+        .astimezone(timezone.utc)
+        .timestamp()
+        * 1000
+    )
+    connection = connect(database_path)
+    try:
+        with connection:
+            connection.execute(
+                """
+                DELETE FROM candles
+                WHERE provider = ? AND symbol = ? AND interval_seconds = 60
+                    AND timestamp_ms >= ? AND timestamp_ms < ?
+                """,
+                (HISTDATA_PROVIDER, batch.symbol, year_start, next_year_start),
+            )
+            inserted = save_historical_candles(
+                connection,
+                batch.candles,
+                provider=HISTDATA_PROVIDER,
+                symbol=batch.symbol,
+                interval_seconds=60,
+                source_resolution_ms=HISTDATA_RESOLUTION_MS,
+            )
+            connection.execute(
+                """
+                INSERT INTO market_instruments (
+                    provider, market_type, symbol, display_name, updated_at_ms
+                ) VALUES (?, 'CLASSIC', ?, ?, ?)
+                ON CONFLICT (provider, market_type, symbol) DO UPDATE SET
+                    enabled = 1,
+                    updated_at_ms = excluded.updated_at_ms
+                """,
+                (
+                    HISTDATA_PROVIDER,
+                    batch.symbol,
+                    batch.symbol,
+                    int(time.time() * 1000),
+                ),
+            )
+        return inserted
+    finally:
+        connection.close()
+
+
+async def _sync_public_reference_history(database_path: Path) -> None:
+    while True:
+        end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+        async with FrankfurterClient() as provider:
+            for symbol in REFERENCE_PAIRS:
+                _set_reference_sync_status(database_path, symbol, "loading")
+                connection = connect(database_path)
+                try:
+                    coverage = connection.execute(
+                        """
+                        SELECT COUNT(*) AS rate_count
+                        FROM reference_rates
+                        WHERE provider = ? AND base_currency = ? AND quote_currency = ?
+                        """,
+                        (
+                            REFERENCE_PROVIDER,
+                            *symbol.split("/"),
+                        ),
+                    ).fetchone()
+                    start_date = (
+                        REFERENCE_EARLIEST_DATE
+                        if coverage["rate_count"] == 0
+                        else max(
+                            REFERENCE_EARLIEST_DATE,
+                            end_date - timedelta(days=30),
+                        )
+                    )
+                    if start_date <= end_date:
+                        try:
+                            rates = await provider.history(symbol, start_date, end_date)
+                            if not rates:
+                                raise RuntimeError(
+                                    "Frankfurter returned no data for a non-empty history range"
+                                )
+                            with connection:
+                                save_reference_rates(connection, symbol, rates)
+                            _set_reference_sync_status(
+                                database_path,
+                                symbol,
+                                "ready",
+                                successful=True,
+                            )
+                        except (RuntimeError, sqlite3.Error) as error:
+                            _set_reference_sync_status(
+                                database_path,
+                                symbol,
+                                "error",
+                                error_message=str(error)[:500],
+                            )
+                            logger.exception(
+                                "Public reference-history synchronization failed for %s",
+                                symbol,
+                            )
+                finally:
+                    connection.close()
+                await asyncio.sleep(0.25)
+        await asyncio.sleep(12 * 60 * 60)
+
+
+async def _sync_histdata_history(database_path: Path) -> None:
+    while True:
+        made_progress = False
+        now_ms = int(time.time() * 1000)
+        for symbol in DUKASCOPY_INSTRUMENTS:
+            try:
+                async with HistDataClient() as provider:
+                    years = await provider.available_years(symbol)
+                    connection = connect(database_path)
+                    try:
+                        sync_row = connection.execute(
+                            """
+                            SELECT last_scanned_timestamp_ms, last_success_at_ms
+                            FROM public_history_sync
+                            WHERE provider = ? AND symbol = ?
+                            """,
+                            (HISTDATA_PROVIDER, symbol),
+                        ).fetchone()
+                        latest_row = connection.execute(
+                            """
+                            SELECT MAX(timestamp_ms) AS latest_timestamp_ms
+                            FROM candles
+                            WHERE provider = ? AND symbol = ? AND interval_seconds = 60
+                                AND data_kind = 'HISTORICAL'
+                            """,
+                            (HISTDATA_PROVIDER, symbol),
+                        ).fetchone()
+                    finally:
+                        connection.close()
+
+                    newest_year = years[-1]
+                    oldest_year = years[0]
+                    latest_saved_year = (
+                        datetime.fromtimestamp(
+                            latest_row["latest_timestamp_ms"] / 1000,
+                            tz=timezone(timedelta(hours=-5)),
+                        ).year
+                        if latest_row["latest_timestamp_ms"] is not None
+                        else None
+                    )
+                    cursor = (
+                        sync_row["last_scanned_timestamp_ms"] if sync_row else None
+                    )
+                    if latest_saved_year is None or latest_saved_year < newest_year:
+                        target_year = newest_year
+                    elif cursor is None:
+                        target_year = newest_year
+                    elif cursor > 0:
+                        last_year = datetime.fromtimestamp(
+                            cursor / 1000, tz=timezone.utc
+                        ).year
+                        target_year = last_year - 1 if last_year > oldest_year else None
+                    elif (
+                        cursor == 0
+                        and sync_row is not None
+                        and sync_row["last_success_at_ms"] is not None
+                        and now_ms - sync_row["last_success_at_ms"]
+                        >= 7 * 24 * 60 * 60 * 1000
+                    ):
+                        target_year = newest_year
+                    else:
+                        target_year = None
+
+                    if target_year is None or target_year not in years:
+                        continue
+
+                    _set_reference_sync_status(
+                        database_path, symbol, "loading", provider=HISTDATA_PROVIDER
+                    )
+                    batch = await provider.fetch_year(symbol, target_year)
+                    inserted = _persist_histdata_batch(database_path, batch)
+                    scan_cursor = (
+                        0
+                        if target_year == oldest_year or cursor == 0
+                        else int(
+                            datetime(
+                                target_year, 1, 1, tzinfo=timezone.utc
+                            ).timestamp()
+                            * 1000
+                        )
+                    )
+                    _set_reference_sync_status(
+                        database_path,
+                        symbol,
+                        "ready",
+                        provider=HISTDATA_PROVIDER,
+                        successful=True,
+                        scanned_until_ms=scan_cursor,
+                    )
+                    made_progress = True
+                    logger.info(
+                        "HistData imported %s %s: %s M1 candles (%s inserted, %s gaps)",
+                        symbol,
+                        target_year,
+                        len(batch.candles),
+                        inserted,
+                        batch.missing_intervals,
+                    )
+            except (MarketDataError, sqlite3.Error, ValueError) as error:
+                _set_reference_sync_status(
+                    database_path,
+                    symbol,
+                    "error",
+                    provider=HISTDATA_PROVIDER,
+                    error_message=str(error)[:500],
+                )
+                logger.warning("Automatic HistData sync failed for %s: %s", symbol, error)
+            await asyncio.sleep(2)
+        await asyncio.sleep(60 if made_progress else 24 * 60 * 60)
+
+
+async def _sync_recent_dukascopy_history(database_path: Path) -> None:
+    while True:
+        now = datetime.now(timezone.utc)
+        completed_hour = now.replace(minute=0, second=0, microsecond=0)
+        for symbol in DUKASCOPY_INSTRUMENTS:
+            connection = connect(database_path)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT MAX(timestamp_ms) AS latest_timestamp_ms
+                    FROM market_ticks WHERE provider = ? AND symbol = ?
+                    """,
+                    (DUKASCOPY_PROVIDER, symbol),
+                ).fetchone()
+                sync_row = connection.execute(
+                    """
+                    SELECT last_scanned_timestamp_ms FROM public_history_sync
+                    WHERE provider = ? AND symbol = ?
+                    """,
+                    (DUKASCOPY_PROVIDER, symbol),
+                ).fetchone()
+            finally:
+                connection.close()
+            latest_scanned_ms = max(
+                (
+                    value
+                    for value in (
+                        row["latest_timestamp_ms"],
+                        sync_row["last_scanned_timestamp_ms"] if sync_row else None,
+                    )
+                    if value is not None
+                ),
+                default=None,
+            )
+            if latest_scanned_ms is None:
+                window_start = completed_hour - timedelta(hours=MAX_HOURS_PER_REQUEST)
+            else:
+                latest_scanned_time = datetime.fromtimestamp(
+                    latest_scanned_ms / 1000,
+                    tz=timezone.utc,
+                )
+                window_start = latest_scanned_time.replace(
+                    minute=0, second=0, microsecond=0
+                ) + timedelta(hours=1)
+            if window_start >= completed_hour:
+                continue
+            window_end = min(
+                window_start + timedelta(hours=MAX_HOURS_PER_REQUEST),
+                completed_hour,
+                window_start.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                + timedelta(days=1),
+            )
+            if window_end <= window_start:
+                continue
+            start_hour = window_start.hour
+            end_hour = 24 if window_end.date() != window_start.date() else window_end.hour
+            if start_hour >= end_hour:
+                continue
+            _set_reference_sync_status(
+                database_path,
+                symbol,
+                "loading",
+                provider=DUKASCOPY_PROVIDER,
+            )
+            try:
+                async with DukascopyClient() as provider:
+                    batch = await provider.fetch_candles(
+                        symbol,
+                        window_start.date(),
+                        start_hour=start_hour,
+                        end_hour=end_hour,
+                        interval_seconds=1,
+                    )
+                _persist_dukascopy_batch(
+                    database_path,
+                    batch,
+                    interval_seconds=1,
+                )
+                _set_reference_sync_status(
+                    database_path,
+                    symbol,
+                    "ready",
+                    provider=DUKASCOPY_PROVIDER,
+                    successful=True,
+                    scanned_until_ms=int(window_end.timestamp() * 1000),
+                )
+            except (MarketDataError, sqlite3.Error, ValueError) as error:
+                _set_reference_sync_status(
+                    database_path,
+                    symbol,
+                    "error",
+                    provider=DUKASCOPY_PROVIDER,
+                    error_message=str(error)[:500],
+                )
+                logger.warning(
+                    "Automatic Dukascopy sync failed for %s: %s", symbol, error
+                )
+            await asyncio.sleep(1)
+        await asyncio.sleep(24 * 60 * 60)
 
 class Instrument(BaseModel):
     provider: str
@@ -48,6 +502,7 @@ class HistoricalImportRequest(BaseModel):
 
 class CandleResponse(BaseModel):
     timestamp_ms: int
+    source_resolution_ms: int | None = None
     open: float
     high: float
     low: float
@@ -106,6 +561,7 @@ def _provider_http_error(error: MarketDataError) -> HTTPException:
 
 
 def create_app(database_path: Path | None = None) -> FastAPI:
+    automatic_sync = database_path is None
     resolved_database_path = database_path or Path(
         os.environ.get("DATABASE_PATH", "data/signals.db")
     )
@@ -113,7 +569,34 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         initialize_database(resolved_database_path)
-        yield
+        sync_tasks = (
+            [
+                asyncio.create_task(
+                    _sync_public_reference_history(resolved_database_path),
+                    name="public-reference-history-sync",
+                ),
+                asyncio.create_task(
+                    _sync_recent_dukascopy_history(resolved_database_path),
+                    name="dukascopy-history-sync",
+                ),
+                asyncio.create_task(
+                    _sync_histdata_history(resolved_database_path),
+                    name="histdata-history-sync",
+                ),
+            ]
+            if automatic_sync
+            else []
+        )
+        try:
+            yield
+        finally:
+            for sync_task in sync_tasks:
+                sync_task.cancel()
+            for sync_task in sync_tasks:
+                try:
+                    await sync_task
+                except asyncio.CancelledError:
+                    pass
 
     application = FastAPI(
         title="Pocket Signal Assistant API",
@@ -149,6 +632,18 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             SELECT provider, market_type, symbol, display_name
             FROM market_instruments
             WHERE enabled = 1
+            UNION
+            SELECT DISTINCT candles.provider, candles.market_type,
+                candles.symbol, candles.symbol AS display_name
+            FROM candles
+            WHERE candles.data_kind = 'HISTORICAL'
+                AND candles.market_type = 'CLASSIC'
+                AND NOT EXISTS (
+                    SELECT 1 FROM market_instruments
+                    WHERE market_instruments.provider = candles.provider
+                        AND market_instruments.market_type = candles.market_type
+                        AND market_instruments.symbol = candles.symbol
+                )
             ORDER BY market_type, symbol
             """
         ).fetchall()
@@ -162,6 +657,463 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 instrument.market_type == "OTC" for instrument in instruments
             ),
         )
+
+    @application.get("/api/v1/history/instruments")
+    @application.get("/api/v1/history/dukascopy/instruments")
+    def dukascopy_instruments(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+    ) -> dict[str, object]:
+        coverage = {
+            row["symbol"]: dict(row)
+            for row in connection.execute(
+                """
+                SELECT symbol, MIN(timestamp_ms) AS first_timestamp_ms,
+                    MAX(timestamp_ms) AS last_timestamp_ms, COUNT(*) AS candles_count
+                FROM candles
+                WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+                GROUP BY symbol
+                """,
+                (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
+            ).fetchall()
+        }
+        tick_coverage = {
+            row["symbol"]: dict(row)
+            for row in connection.execute(
+                """
+                SELECT symbol, MIN(timestamp_ms) AS first_tick_timestamp_ms,
+                    MAX(timestamp_ms) AS last_tick_timestamp_ms,
+                    COUNT(*) AS ticks_count
+                FROM market_ticks
+                WHERE provider = ?
+                GROUP BY symbol
+                """,
+                (DUKASCOPY_PROVIDER,),
+            ).fetchall()
+        }
+        interval_coverage: dict[str, set[int]] = {}
+        for row in connection.execute(
+            """
+            SELECT symbol, interval_seconds
+            FROM candles
+            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+            GROUP BY symbol, interval_seconds
+            """,
+            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
+        ):
+            interval_coverage.setdefault(row["symbol"], set()).add(
+                row["interval_seconds"]
+            )
+        source_intervals: dict[tuple[str, str], set[int]] = {}
+        for row in connection.execute(
+            """
+            SELECT symbol, provider, interval_seconds
+            FROM candles
+            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+            GROUP BY symbol, provider, interval_seconds
+            """,
+            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
+        ):
+            source_intervals.setdefault((row["symbol"], row["provider"]), set()).add(
+                row["interval_seconds"]
+            )
+        source_resolutions: dict[str, set[int]] = {}
+        for row in connection.execute(
+            """
+            SELECT symbol, source_resolution_ms
+            FROM candles
+            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+                AND source_resolution_ms IS NOT NULL
+            GROUP BY symbol, source_resolution_ms
+            """,
+            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
+        ):
+            source_resolutions.setdefault(row["symbol"], set()).add(
+                row["source_resolution_ms"]
+            )
+        return {
+            "provider": f"{HISTDATA_PROVIDER} / {DUKASCOPY_PROVIDER}",
+            "instruments": [
+                {
+                    "provider": (
+                        DUKASCOPY_PROVIDER
+                        if 1 in source_intervals.get((symbol, DUKASCOPY_PROVIDER), set())
+                        else HISTDATA_PROVIDER
+                        if source_intervals.get((symbol, HISTDATA_PROVIDER))
+                        else DUKASCOPY_PROVIDER
+                    ),
+                    "market_type": "CLASSIC",
+                    "symbol": symbol,
+                    "display_name": symbol,
+                    "history_available": symbol in coverage,
+                    "first_timestamp_ms": coverage.get(symbol, {}).get(
+                        "first_timestamp_ms"
+                    ),
+                    "last_timestamp_ms": coverage.get(symbol, {}).get(
+                        "last_timestamp_ms"
+                    ),
+                    "candles_count": coverage.get(symbol, {}).get("candles_count", 0),
+                    "available_sources": [
+                        source
+                        for source in (HISTDATA_PROVIDER, DUKASCOPY_PROVIDER)
+                        if source_intervals.get((symbol, source))
+                    ],
+                    "available_intervals_seconds": sorted(
+                        interval_coverage.get(symbol, set())
+                    ),
+                    "available_source_resolutions_ms": sorted(
+                        source_resolutions.get(symbol, set())
+                    ),
+                    "available_expirations_seconds": sorted(
+                        {
+                            expiry
+                            for interval in interval_coverage.get(symbol, set())
+                            for expiry in (5, 10, 15, 20, 25, 30, 60, 120, 180, 240, 300, 600, 900)
+                            if expiry >= interval and expiry % interval == 0
+                        }
+                    ),
+                    "ticks_count": tick_coverage.get(symbol, {}).get("ticks_count", 0),
+                    "tick_timestamp_resolution_ms": 1
+                    if symbol in tick_coverage
+                    else None,
+                    "first_tick_timestamp_ms": tick_coverage.get(symbol, {}).get(
+                        "first_tick_timestamp_ms"
+                    ),
+                    "last_tick_timestamp_ms": tick_coverage.get(symbol, {}).get(
+                        "last_tick_timestamp_ms"
+                    ),
+                }
+                for symbol in DUKASCOPY_INSTRUMENTS
+            ],
+        }
+
+    @application.get("/api/v1/history/reference/instruments")
+    def reference_instruments(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+    ) -> dict[str, object]:
+        coverage = {
+            f'{row["base_currency"]}/{row["quote_currency"]}': dict(row)
+            for row in connection.execute(
+                """
+                SELECT base_currency, quote_currency,
+                    MIN(rate_date) AS first_date,
+                    MAX(rate_date) AS last_date,
+                    COUNT(*) AS observations
+                FROM reference_rates
+                WHERE provider = ?
+                GROUP BY base_currency, quote_currency
+                """,
+                (REFERENCE_PROVIDER,),
+            ).fetchall()
+        }
+        return {
+            "provider": REFERENCE_PROVIDER,
+            "resolution_seconds": 86400,
+            "data_kind": "DAILY_REFERENCE_RATE",
+            "instruments": [
+                {
+                    "symbol": symbol,
+                    "first_date": coverage.get(symbol, {}).get("first_date"),
+                    "last_date": coverage.get(symbol, {}).get("last_date"),
+                    "observations": coverage.get(symbol, {}).get("observations", 0),
+                }
+                for symbol in REFERENCE_PAIRS
+            ],
+        }
+
+    @application.get("/api/v1/history/reference")
+    def reference_history(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+        symbol: str = Query(min_length=7, max_length=7),
+        start_date: Date | None = None,
+        end_date: Date | None = None,
+        limit: int = Query(default=5000, ge=1, le=10000),
+    ) -> dict[str, object]:
+        normalized_symbol = symbol.upper()
+        if normalized_symbol not in REFERENCE_PAIRS:
+            raise HTTPException(status_code=422, detail="Unsupported reference-rate pair")
+        query = """
+            SELECT rate_date, rate
+            FROM reference_rates
+            WHERE provider = ? AND base_currency = ? AND quote_currency = ?
+        """
+        parameters: list[object] = [
+            REFERENCE_PROVIDER,
+            *normalized_symbol.split("/"),
+        ]
+        if start_date is not None:
+            query += " AND rate_date >= ?"
+            parameters.append(start_date.isoformat())
+        if end_date is not None:
+            query += " AND rate_date <= ?"
+            parameters.append(end_date.isoformat())
+        query += " ORDER BY rate_date DESC LIMIT ?"
+        parameters.append(limit)
+        rows = connection.execute(query, parameters).fetchall()
+        return {
+            "provider": REFERENCE_PROVIDER,
+            "symbol": normalized_symbol,
+            "resolution_seconds": 86400,
+            "data_kind": "DAILY_REFERENCE_RATE",
+            "rates": [
+                {"date": row["rate_date"], "rate": row["rate"]}
+                for row in reversed(rows)
+            ],
+        }
+
+    @application.get("/api/v1/history/dukascopy/ticks")
+    def dukascopy_ticks(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+        symbol: str = Query(min_length=1, max_length=24),
+        from_ms: int | None = Query(default=None, ge=0),
+        to_ms: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=5000, ge=1, le=50000),
+    ) -> dict[str, object]:
+        normalized_symbol = symbol.upper()
+        if normalized_symbol not in DUKASCOPY_INSTRUMENTS:
+            raise HTTPException(status_code=422, detail="Unsupported Dukascopy instrument")
+        if from_ms is not None and to_ms is not None and from_ms > to_ms:
+            raise HTTPException(status_code=422, detail="from_ms must not exceed to_ms")
+        query = """
+            SELECT timestamp_ms, timestamp_resolution_ms, bid, ask
+            FROM market_ticks
+            WHERE provider = ? AND symbol = ?
+        """
+        parameters: list[object] = [DUKASCOPY_PROVIDER, normalized_symbol]
+        if from_ms is not None:
+            query += " AND timestamp_ms >= ?"
+            parameters.append(from_ms)
+        if to_ms is not None:
+            query += " AND timestamp_ms <= ?"
+            parameters.append(to_ms)
+        query += " ORDER BY timestamp_ms ASC, tick_sequence ASC LIMIT ?"
+        parameters.append(limit)
+        rows = connection.execute(query, parameters).fetchall()
+        return {
+            "provider": DUKASCOPY_PROVIDER,
+            "symbol": normalized_symbol,
+            "data_kind": "HISTORICAL_TICKS",
+            "timestamp_resolution_ms": 1,
+            "ticks": [
+                {
+                    "timestamp_ms": row["timestamp_ms"],
+                    "timestamp_resolution_ms": row["timestamp_resolution_ms"],
+                    "bid": row["bid"],
+                    "ask": row["ask"],
+                }
+                for row in rows
+            ],
+        }
+
+    @application.get("/api/v1/sources/status")
+    def source_status(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+        symbol: str | None = Query(default=None, min_length=1, max_length=24),
+    ) -> dict[str, object]:
+        now_ms = int(time.time() * 1000)
+        try:
+            normalized_symbol = normalize_symbol(symbol) if symbol else None
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        online_parameters: list[object] = [PROVIDER_NAME]
+        online_filter = ""
+        if normalized_symbol is not None:
+            online_filter = " AND symbol = ?"
+            online_parameters.append(normalized_symbol)
+        latest_tick = connection.execute(
+            f"""
+            SELECT symbol, timestamp_ms FROM ticks
+            WHERE provider = ?{online_filter}
+            ORDER BY timestamp_ms DESC LIMIT 1
+            """,
+            online_parameters,
+        ).fetchone()
+        key_configured = bool(os.getenv("TWELVE_DATA_API_KEY"))
+        age_ms = (
+            max(0, now_ms - latest_tick["timestamp_ms"])
+            if latest_tick is not None
+            else None
+        )
+        online_ready = bool(key_configured and age_ms is not None and age_ms <= 2000)
+        reference_latest = connection.execute(
+            """
+            SELECT MAX(rate_date) AS last_date, MAX(retrieved_at_ms) AS retrieved_at_ms,
+                COUNT(*) AS observations
+            FROM reference_rates WHERE provider = ?
+            """,
+            (REFERENCE_PROVIDER,),
+        ).fetchone()
+        sync_status = [
+            {
+                "provider": row["provider"],
+                "symbol": row["symbol"],
+                "status": row["status"],
+                "updated_at_ms": row["updated_at_ms"],
+                "last_success_at_ms": row["last_success_at_ms"],
+                "error_message": row["error_message"],
+            }
+            for row in connection.execute(
+                """
+                SELECT provider, symbol, status, updated_at_ms,
+                    last_success_at_ms, error_message
+                FROM public_history_sync
+                ORDER BY provider, symbol
+                """
+            ).fetchall()
+        ]
+        dukascopy_sync = [
+            item for item in sync_status if item["provider"] == DUKASCOPY_PROVIDER
+        ]
+        dukascopy_sync_ready = any(
+            item["last_success_at_ms"] is not None for item in dukascopy_sync
+        )
+        dukascopy_sync_loading = any(
+            item["status"] == "loading" for item in dukascopy_sync
+        )
+        dukascopy_sync_errors = [
+            item["error_message"]
+            for item in dukascopy_sync
+            if item["error_message"] is not None
+        ]
+        histdata_sync = [
+            item for item in sync_status if item["provider"] == HISTDATA_PROVIDER
+        ]
+        histdata_candles = connection.execute(
+            """
+            SELECT COUNT(*) AS candles_count, MIN(timestamp_ms) AS first_timestamp_ms,
+                MAX(timestamp_ms) AS last_timestamp_ms
+            FROM candles
+            WHERE provider = ? AND data_kind = 'HISTORICAL'
+                AND (? IS NULL OR symbol = ?)
+            """,
+            (HISTDATA_PROVIDER, normalized_symbol, normalized_symbol),
+        ).fetchone()
+        if histdata_candles["candles_count"]:
+            histdata_status = "ready"
+        elif any(item["status"] == "loading" for item in histdata_sync):
+            histdata_status = "loading"
+        elif any(item["error_message"] for item in histdata_sync):
+            histdata_status = "unavailable"
+        else:
+            histdata_status = "not_yet_checked"
+        if dukascopy_sync_ready:
+            dukascopy_status = "ready"
+        elif dukascopy_sync_loading:
+            dukascopy_status = "loading"
+        elif any(
+            "429" in message or "rate limit" in message.lower()
+            for message in dukascopy_sync_errors
+        ):
+            dukascopy_status = "rate_limited"
+        elif dukascopy_sync_errors:
+            dukascopy_status = "unavailable"
+        else:
+            dukascopy_status = "not_yet_checked"
+        return {
+            "server_time_ms": now_ms,
+            "online": {
+                "provider": PROVIDER_NAME,
+                "status": "ready"
+                if online_ready
+                else "not_configured"
+                if not key_configured
+                else "stale_or_unavailable",
+                "ready": online_ready,
+                "reason": None
+                if online_ready
+                else "Twelve Data API key is not configured on the backend."
+                if not key_configured
+                else "No quote newer than two seconds is available from the live feed.",
+                "last_quote_timestamp_ms": (
+                    latest_tick["timestamp_ms"] if latest_tick is not None else None
+                ),
+                "quote_age_ms": age_ms,
+                "update_frequency": "provider-driven WebSocket; no keyless live source verified",
+            },
+            "historical": {
+                "histdata_provider": HISTDATA_PROVIDER,
+                "histdata_status": histdata_status,
+                "histdata_resolution_seconds": 60,
+                "histdata_candles": histdata_candles["candles_count"],
+                "histdata_first_timestamp_ms": histdata_candles["first_timestamp_ms"],
+                "histdata_last_timestamp_ms": histdata_candles["last_timestamp_ms"],
+                "dukascopy_provider": DUKASCOPY_PROVIDER,
+                "dukascopy_status": dukascopy_status,
+                "reference_provider": REFERENCE_PROVIDER,
+                "reference_resolution_seconds": 86400,
+                "reference_last_date": reference_latest["last_date"],
+                "reference_retrieved_at_ms": reference_latest["retrieved_at_ms"],
+                "reference_observations": reference_latest["observations"],
+                "reference_status": "daily_reference_only_not_intraday",
+                "sync_status": sync_status,
+            },
+        }
+
+    @application.post("/api/v1/history/dukascopy/import")
+    async def import_dukascopy_history(
+        symbol: str = Query(min_length=1, max_length=24),
+        trading_date: Date = Query(alias="date"),
+        start_hour: int = Query(default=0, ge=0, le=23),
+        end_hour: int = Query(default=24, ge=1, le=24),
+        interval_seconds: int = Query(default=60, ge=1, le=3600),
+    ) -> dict[str, int | str]:
+        normalized_symbol = symbol.upper()
+        if normalized_symbol not in DUKASCOPY_INSTRUMENTS:
+            raise HTTPException(status_code=422, detail="Unsupported Dukascopy instrument")
+        if start_hour >= end_hour:
+            raise HTTPException(
+                status_code=422, detail="start_hour must be less than end_hour"
+            )
+        if end_hour - start_hour > MAX_HOURS_PER_REQUEST:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Import at most {MAX_HOURS_PER_REQUEST} UTC hours per request",
+            )
+        now = datetime.now(timezone.utc)
+        if trading_date > now.date() or (
+            trading_date == now.date() and end_hour > now.hour
+        ):
+            raise HTTPException(
+                status_code=422, detail="Historical import cannot include future hours"
+            )
+
+        try:
+            async with DukascopyClient() as provider:
+                batch = await provider.fetch_candles(
+                    normalized_symbol,
+                    trading_date,
+                    start_hour=start_hour,
+                    end_hour=end_hour,
+                    interval_seconds=interval_seconds,
+                )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except MarketDataError as error:
+            raise HTTPException(
+                status_code=502, detail=f"Dukascopy historical data error: {error}"
+            ) from error
+
+        imported, ticks_imported = _persist_dukascopy_batch(
+            resolved_database_path,
+            batch,
+            interval_seconds=interval_seconds,
+        )
+
+        return {
+            "provider": DUKASCOPY_PROVIDER,
+            "symbol": normalized_symbol,
+            "date": batch.date.isoformat(),
+            "start_hour": batch.start_hour,
+            "end_hour": batch.end_hour,
+            "interval_seconds": interval_seconds,
+            "source_resolution_ms": 1,
+            "files_requested": batch.files_requested,
+            "files_missing": batch.files_missing,
+            "ticks_received": batch.ticks_received,
+            "ticks_imported": ticks_imported,
+            "candles_received": len(batch.candles),
+            "candles_imported": imported,
+            "missing_intervals": batch.missing_intervals,
+        }
 
     @application.post("/api/v1/provider/twelvedata/catalog")
     async def refresh_twelvedata_catalog(
@@ -217,7 +1169,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(error)) from error
         rows = connection.execute(
             """
-            SELECT timestamp_ms, open, high, low, close, volume
+            SELECT timestamp_ms, source_resolution_ms, open, high, low, close, volume
             FROM candles
             WHERE provider = ? AND symbol = ? AND interval_seconds = ?
                 AND data_kind = ?
@@ -262,7 +1214,6 @@ def create_app(database_path: Path | None = None) -> FastAPI:
 
     @application.post("/api/v1/history/twelvedata")
     async def fetch_twelvedata_history(
-        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
         symbol: str = Query(min_length=1, max_length=24),
         interval_seconds: int = Query(ge=60, le=86400),
         outputsize: int = Query(default=500, ge=1, le=5000),
@@ -282,32 +1233,19 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if not history:
             raise HTTPException(status_code=502, detail="Provider returned no historical candles")
 
-        with connection:
-            connection.executemany(
-                """
-                INSERT INTO candles (
-                    provider, market_type, symbol, interval_seconds, timestamp_ms,
-                    open, high, low, close, volume, data_kind
-                ) VALUES (?, 'CLASSIC', ?, ?, ?, ?, ?, ?, ?, ?, 'HISTORICAL')
-                ON CONFLICT (provider, symbol, interval_seconds, timestamp_ms, data_kind)
-                DO NOTHING
-                """,
-                [
-                    (
-                        PROVIDER_NAME,
-                        normalized_symbol,
-                        interval_seconds,
-                        candle.timestamp_ms,
-                        candle.open,
-                        candle.high,
-                        candle.low,
-                        candle.close,
-                        candle.volume,
-                    )
-                    for candle in history
-                ],
-            )
-            imported = cursor.rowcount
+        history_connection = connect(resolved_database_path)
+        try:
+            with history_connection:
+                imported = save_historical_candles(
+                    history_connection,
+                    history,
+                    provider=PROVIDER_NAME,
+                    symbol=normalized_symbol,
+                    interval_seconds=interval_seconds,
+                    source_resolution_ms=interval_seconds * 1000,
+                )
+        finally:
+            history_connection.close()
         return {
             "provider": PROVIDER_NAME,
             "symbol": normalized_symbol,
@@ -675,7 +1613,22 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         connection: Annotated[sqlite3.Connection, Depends(get_connection)],
     ) -> AnalysisResponse:
         analysis_started = time.perf_counter()
-        if request.expiry_seconds not in (3, 5, 10, 15, 30, 60, 120, 180, 240, 300, 600, 900):
+        if request.expiry_seconds not in (
+            3,
+            5,
+            10,
+            15,
+            20,
+            25,
+            30,
+            60,
+            120,
+            180,
+            240,
+            300,
+            600,
+            900,
+        ):
             raise HTTPException(status_code=422, detail="Unsupported expiration")
         if request.market_type == "OTC":
             raise HTTPException(
@@ -925,6 +1878,289 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             "accuracy_percent": result.accuracy_percent,
             "out_of_sample_start_ms": result.out_of_sample_start_ms,
             "evaluation": "out-of-sample; minute candles; not seconds validation",
+        }
+
+    @application.get("/api/v1/backtest/history")
+    @application.get("/api/v1/backtest/dukascopy")
+    def backtest_dukascopy(
+        connection: Annotated[sqlite3.Connection, Depends(get_connection)],
+        symbol: str = Query(min_length=1, max_length=24),
+        period_days: int = Query(default=1, ge=1, le=3650),
+        expiry_seconds: list[int] = Query(default=[60, 300, 900]),
+        availability_only: bool = Query(default=False),
+    ) -> dict[str, object]:
+        normalized_symbol = symbol.upper()
+        if normalized_symbol not in DUKASCOPY_INSTRUMENTS:
+            raise HTTPException(status_code=422, detail="Unsupported Dukascopy symbol")
+        supported_expiries = {5, 10, 15, 20, 25, 30, 60, 120, 180, 240, 300, 600, 900}
+        if (
+            not expiry_seconds
+            or len(expiry_seconds) > 3
+            or any(expiry not in supported_expiries for expiry in expiry_seconds)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Select one to three supported historical expirations",
+            )
+
+        now = datetime.now(timezone.utc)
+        latest_history = connection.execute(
+            """
+            SELECT MAX(timestamp_ms) AS latest_timestamp_ms
+            FROM candles
+            WHERE provider IN (?, ?) AND symbol = ? AND data_kind = 'HISTORICAL'
+            """,
+            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER, normalized_symbol),
+        ).fetchone()["latest_timestamp_ms"]
+        period_end_date = (
+            datetime.fromtimestamp(latest_history / 1000, tz=timezone.utc).date()
+            if latest_history is not None
+            else now.date()
+        )
+        period_start = datetime.combine(
+            period_end_date - timedelta(days=period_days - 1),
+            DateTime.min,
+            tzinfo=timezone.utc,
+        )
+        start_ms = int(period_start.timestamp() * 1000)
+        end_ms = min(
+            int(now.timestamp() * 1000),
+            int(latest_history + 60_000)
+            if latest_history is not None
+            else int(now.timestamp() * 1000),
+        )
+        source_intervals = {
+            (row["provider"], row["interval_seconds"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT provider, interval_seconds
+                FROM candles
+                WHERE provider IN (?, ?) AND symbol = ? AND data_kind = 'HISTORICAL'
+                    AND timestamp_ms >= ? AND timestamp_ms <= ?
+                """,
+                (
+                    DUKASCOPY_PROVIDER,
+                    HISTDATA_PROVIDER,
+                    normalized_symbol,
+                    start_ms,
+                    end_ms,
+                ),
+            )
+        }
+        if (DUKASCOPY_PROVIDER, 1) in source_intervals:
+            provider = DUKASCOPY_PROVIDER
+        elif (HISTDATA_PROVIDER, 60) in source_intervals:
+            provider = HISTDATA_PROVIDER
+        else:
+            provider = DUKASCOPY_PROVIDER
+        intervals = {
+            interval
+            for source, interval in source_intervals
+            if source == provider
+        }
+        if availability_only:
+            counts_by_interval: dict[str, int] = {}
+            gaps_by_interval: dict[str, int] = {}
+            first_timestamps: list[int] = []
+            last_timestamps: list[int] = []
+            for interval in intervals:
+                interval_ms = interval * 1000
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS candle_count,
+                        MIN(timestamp_ms) AS first_timestamp_ms,
+                        MAX(timestamp_ms) AS last_timestamp_ms,
+                        COALESCE(SUM(
+                            CASE
+                                WHEN previous_timestamp_ms IS NOT NULL
+                                    AND timestamp_ms - previous_timestamp_ms > ?
+                                THEN (timestamp_ms - previous_timestamp_ms) / ? - 1
+                                ELSE 0
+                            END
+                        ), 0) AS missing_intervals
+                    FROM (
+                        SELECT timestamp_ms,
+                            LAG(timestamp_ms) OVER (ORDER BY timestamp_ms)
+                                AS previous_timestamp_ms
+                        FROM candles
+                        WHERE provider = ? AND symbol = ? AND data_kind = 'HISTORICAL'
+                            AND interval_seconds = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+                    )
+                    """,
+                    (
+                        interval_ms,
+                        interval_ms,
+                        provider,
+                        normalized_symbol,
+                        interval,
+                        start_ms,
+                        end_ms,
+                    ),
+                ).fetchone()
+                counts_by_interval[str(interval)] = row["candle_count"]
+                gaps_by_interval[str(interval)] = row["missing_intervals"]
+                if row["first_timestamp_ms"] is not None:
+                    first_timestamps.append(row["first_timestamp_ms"])
+                    last_timestamps.append(row["last_timestamp_ms"])
+            return {
+                "provider": provider,
+                "symbol": normalized_symbol,
+                "period_days": period_days,
+                "period_start_ms": start_ms,
+                "period_end_ms": end_ms,
+                "candle_count": counts_by_interval.get(
+                    "1" if 1 in intervals else "60", 0
+                ),
+                "candle_counts_by_interval": counts_by_interval,
+                "missing_intervals": gaps_by_interval.get(
+                    "1" if 1 in intervals else "60", 0
+                ),
+                "missing_intervals_by_interval": gaps_by_interval,
+                "first_timestamp_ms": min(first_timestamps, default=None),
+                "last_timestamp_ms": max(last_timestamps, default=None),
+                "available_intervals_seconds": sorted(intervals),
+                "available_expirations_seconds": sorted(
+                    expiry
+                    for expiry in supported_expiries
+                    if (1 in intervals and expiry >= 5)
+                    or (60 in intervals and expiry >= 60)
+                ),
+                "cost_adjusted": False,
+                "cost_note": (
+                    "Bid-only simulation; spread, commissions, and slippage are not included."
+                ),
+                "results": [],
+            }
+        counts_by_interval: dict[int, int] = {}
+        candles_by_interval: dict[int, list[Candle]] = {}
+        gaps_by_interval: dict[int, int] = {}
+        for interval in intervals:
+            rows = connection.execute(
+                """
+                SELECT timestamp_ms, open, high, low, close, volume
+                FROM candles
+                WHERE provider = ? AND symbol = ? AND data_kind = 'HISTORICAL'
+                    AND interval_seconds = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+                ORDER BY timestamp_ms ASC
+                """,
+                (provider, normalized_symbol, interval, start_ms, end_ms),
+            ).fetchall()
+            candles = [
+                Candle(
+                    timestamp_ms=row["timestamp_ms"],
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    close=row["close"],
+                    volume=row["volume"],
+                )
+                for row in rows
+            ]
+            interval_ms = interval * 1000
+            counts_by_interval[interval] = len(candles)
+            candles_by_interval[interval] = candles
+            gaps_by_interval[interval] = sum(
+                max(0, (current.timestamp_ms - previous.timestamp_ms) // interval_ms - 1)
+                for previous, current in zip(candles, candles[1:])
+            )
+
+        results: list[dict[str, object]] = []
+        for expiry in sorted(set(expiry_seconds)):
+            interval = 1 if 1 in intervals else 60
+            if interval == 60 and expiry < 60:
+                results.append(
+                    {
+                        "expiry_seconds": expiry,
+                        "resolution_seconds": None,
+                        "status": "unsupported_resolution",
+                        "sample_count": 0,
+                        "trade_count": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "win_rate_percent": None,
+                    }
+                )
+                continue
+            candles = candles_by_interval.get(interval, [])
+            try:
+                backtest_result = run_backtest(
+                    candles,
+                    provider=provider,
+                    symbol=normalized_symbol,
+                    candle_interval_seconds=interval,
+                    expiry_seconds=expiry,
+                )
+            except BacktestError:
+                results.append(
+                    {
+                        "expiry_seconds": expiry,
+                        "resolution_seconds": interval,
+                        "status": "insufficient_data",
+                        "sample_count": 0,
+                        "trade_count": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "win_rate_percent": None,
+                    }
+                )
+                continue
+            status = (
+                "ok"
+                if backtest_result.trade_count
+                else "insufficient_signals"
+                if backtest_result.sample_count
+                else "insufficient_data"
+            )
+            results.append(
+                {
+                    "expiry_seconds": expiry,
+                    "resolution_seconds": interval,
+                    "status": status,
+                    "sample_count": backtest_result.sample_count,
+                    "trade_count": backtest_result.trade_count,
+                    "wins": backtest_result.wins,
+                    "losses": backtest_result.losses,
+                    "win_rate_percent": (
+                        backtest_result.accuracy_percent if status == "ok" else None
+                    ),
+                }
+            )
+        return {
+            "provider": provider,
+            "symbol": normalized_symbol,
+            "period_days": period_days,
+            "period_start_ms": start_ms,
+            "period_end_ms": end_ms,
+            "candle_count": counts_by_interval.get(
+                1 if 1 in intervals else 60, 0
+            ),
+            "candle_counts_by_interval": {
+                str(interval): count for interval, count in counts_by_interval.items()
+            },
+            "missing_intervals": gaps_by_interval.get(1 if 1 in intervals else 60, 0),
+            "missing_intervals_by_interval": {
+                str(interval): count for interval, count in gaps_by_interval.items()
+            },
+            "first_timestamp_ms": min(
+                (candle.timestamp_ms for values in candles_by_interval.values() for candle in values),
+                default=None,
+            ),
+            "last_timestamp_ms": max(
+                (candle.timestamp_ms for values in candles_by_interval.values() for candle in values),
+                default=None,
+            ),
+            "available_intervals_seconds": sorted(intervals),
+            "available_expirations_seconds": sorted(
+                expiry
+                for expiry in supported_expiries
+                if (1 in intervals and expiry >= 5)
+                or (60 in intervals and expiry >= 60)
+            ),
+            "cost_adjusted": False,
+            "cost_note": (
+                "Bid-only simulation; spread, commissions, and slippage are not included."
+            ),
+            "results": results,
         }
 
     @application.websocket("/api/v1/stream")

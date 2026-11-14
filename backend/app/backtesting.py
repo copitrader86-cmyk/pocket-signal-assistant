@@ -32,15 +32,15 @@ def run_backtest(
     candle_interval_seconds: int,
     expiry_seconds: int,
 ) -> BacktestResult:
-    if candle_interval_seconds != 60:
+    if candle_interval_seconds not in (1, 60):
         raise BacktestError(
-            "Current technical backtest requires 1-minute historical candles; "
-            "minute bars cannot validate second-based expirations."
+            "Technical backtesting supports one-second or one-minute historical candles."
         )
-    if expiry_seconds < 60 or expiry_seconds % candle_interval_seconds:
+    if candle_interval_seconds == 60 and expiry_seconds < 60:
+        raise BacktestError("Minute candles cannot validate second-based expirations.")
+    if expiry_seconds < 5 or expiry_seconds % candle_interval_seconds:
         raise BacktestError(
-            "Historical minute candles cannot validate second-based expirations "
-            "or expirations not aligned to the candle interval."
+            "The requested expiration is not supported by this candle resolution."
         )
     ordered = sorted(candles, key=lambda candle: candle.timestamp_ms)
     if len(ordered) < MINIMUM_ANALYSIS_CANDLES + 2:
@@ -64,17 +64,17 @@ def run_backtest(
 
     for start, end in segments:
         first_test_index = max(start + MINIMUM_ANALYSIS_CANDLES, split_index)
-        last_test_index = end - expiry_steps
+        last_test_index = end - expiry_steps + 1
         for index in range(first_test_index, last_test_index):
             sample_count += 1
             test_start_ms = test_start_ms or ordered[index].timestamp_ms
-            analysis = analyze_candles(ordered[start : index + 1])
+            analysis = analyze_candles(ordered[start:index])
             direction = analysis.candidate_direction
             if direction == "NO_SIGNAL":
                 continue
             trade_count += 1
-            entry = ordered[index].close
-            exit_price = ordered[index + expiry_steps].close
+            entry = ordered[index].open
+            exit_price = ordered[index + expiry_steps - 1].close
             if (direction == "UP" and exit_price > entry) or (
                 direction == "DOWN" and exit_price < entry
             ):

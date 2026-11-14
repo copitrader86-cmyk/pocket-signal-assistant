@@ -75,6 +75,10 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
                 60, 1000, 61000, '{}', '{}', 'missing quote')
             """
         )
+        connection.execute("DROP TABLE market_ticks")
+        connection.execute("DROP TABLE reference_rates")
+        connection.execute("DROP TABLE public_history_sync")
+        connection.execute("ALTER TABLE candles DROP COLUMN source_resolution_ms")
         connection.execute("PRAGMA user_version = 2")
 
     initialize_database(database_path)
@@ -85,7 +89,7 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
             "SELECT id, quote_timestamp_ms FROM signals WHERE id = 'keep-me'"
         ).fetchone()
 
-    assert version == 3
+    assert version == 9
     assert tuple(signal) == ("keep-me", None)
 
 
@@ -179,6 +183,42 @@ def test_twelvedata_missing_key_fails_explicitly() -> None:
 
     with pytest.raises(MarketDataError, match="not configured"):
         asyncio.run(fetch())
+
+
+def test_twelvedata_history_api_persists_provider_candles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeTwelveDataClient:
+        async def __aenter__(self) -> "FakeTwelveDataClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def time_series(
+            self, symbol: str, interval_seconds: int, outputsize: int
+        ) -> list[Candle]:
+            assert (symbol, interval_seconds, outputsize) == ("EUR/USD", 60, 1)
+            return [
+                Candle(
+                    timestamp_ms=1_735_689_600_000,
+                    open=1.1,
+                    high=1.2,
+                    low=1.0,
+                    close=1.15,
+                )
+            ]
+
+    monkeypatch.setattr("app.main.TwelveDataClient", FakeTwelveDataClient)
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.post(
+            "/api/v1/history/twelvedata",
+            params={"symbol": "EUR/USD", "interval_seconds": 60, "outputsize": 1},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["rows_received"] == 1
+    assert response.json()["rows_imported"] == 1
 
 
 def test_live_ticks_update_live_candles_without_touching_history(
@@ -398,9 +438,9 @@ def test_backtest_uses_temporal_holdout_and_rejects_seconds_on_minute_bars() -> 
         expiry_seconds=60,
     )
 
-    assert result.sample_count == 23
-    assert result.trade_count == 23
-    assert result.wins == 23
+    assert result.sample_count == 24
+    assert result.trade_count == 24
+    assert result.wins == 24
     assert result.accuracy_percent == 100
     assert result.out_of_sample_start_ms == 96 * 60_000
     with pytest.raises(BacktestError, match="second-based expirations"):

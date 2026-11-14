@@ -31,26 +31,29 @@ pip install -e ".[test]"
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### Prepare a free Render deployment
+### Deploy on Render Free
 
 The backend includes a root `render.yaml` Blueprint and `backend/Dockerfile`.
-After connecting this repository to a Render account, the Blueprint can create
-a free web service with `/health` as its health check. Render assigns the public
-HTTPS hostname after deployment; do not put a guessed hostname in the Android
-build.
+The Blueprint uses Render Free and does not request or configure a persistent
+disk or paid plan. `DATABASE_PATH` points to
+`/tmp/pocket-signal/signals.db`; the Docker image creates this directory for the
+non-root application user, and the backend initializes a new SQLite database
+and schema at startup if none exists.
 
-This free configuration is only suitable for a temporary connectivity check:
-Render free services sleep after 15 minutes without inbound traffic and their
-local filesystem is ephemeral. The SQLite database at `/tmp/pocket-signal` will
-not persist across restarts or spin-downs. The backend also has no API
-authentication, and no market-data provider is configured, so it must not be
-used for real trading or exposed with user trading history. A persistent
-deployment requires an authenticated API and durable database; these are not
-provided by this free SQLite setup.
+Render Free has an ephemeral filesystem. SQLite data, including downloaded
+HistData candles and sync cursors, can be lost when the service restarts,
+redeploys, or spins down. The local development database is not copied to
+Render. On an empty database, the startup HistData worker discovers available
+full-year archives and downloads them in yearly batches; incomplete downloads
+are retried on a later start. The locally verified 372,024 EUR/USD 2025 candles
+can therefore be downloaded again, but are not guaranteed to persist on Free.
+Check `GET /api/v1/sources/status` and `GET /api/v1/history/instruments` after
+deployment to confirm current status and coverage. A successful health check
+alone does not confirm that the updated API is deployed.
 
-Set `DATABASE_PATH` to choose a persistent SQLite database location. Check
-`GET /health` and `GET /api/v1/catalog`; the interactive API documentation is
-available at `/docs`.
+The backend has no API authentication, so do not expose it with user trading
+history or use it for real trading. Check `GET /health` and
+`GET /api/v1/catalog`; interactive API documentation is available at `/docs`.
 
 Run backend tests from `backend/`:
 
@@ -60,10 +63,18 @@ pytest
 
 ## Android app
 
-The Android client uses Kotlin/Jetpack Compose and connects to the API configured
-at build time. The default URL (`http://10.0.2.2:8000`) is for the Android
-emulator reaching a backend on the same host. For a deployed private HTTPS API,
-pass `-PapiBaseUrl=https://your-api-host`.
+The Android client uses Kotlin/Jetpack Compose and connects to
+`https://pocket-signal-assistant.onrender.com` by default. Set the
+`SERVER_BASE_URL` environment variable or `-PserverBaseUrl=https://...` Gradle
+property to override the server for a build. For local backend testing from the
+Android emulator, use:
+
+```sh
+./gradlew assembleDebug -PapiBaseUrl=http://10.0.2.2:8000
+```
+
+The `apiBaseUrl` property takes precedence for debug builds; release builds use
+`releaseApiBaseUrl`, then `SERVER_BASE_URL`, then the Render default.
 
 Build a debug APK with an installed Android SDK and JDK 17+:
 
@@ -77,19 +88,120 @@ session controls, results, history, and statistics. OTC selection remains
 disabled by the server's data-source policy unless a real authorized OTC feed
 is implemented.
 
+The Android Actions workflow builds and uploads the `PocketSignal-debug-apk`
+artifact on manual `workflow_dispatch` runs. It also runs for `v*` tag pushes;
+those tagged runs additionally build and publish a signed release APK when
+release-signing secrets are configured.
+
 ## Market data and API
 
-The existing Twelve Data adapter is optional and requires a provider key. No
-key or paid subscription is required from the user; without a configured key,
+The existing Twelve Data adapter requires an API key configured by the backend
+operator; no provider key is embedded in the Android app or required from its
+users. Twelve Data currently lists a no-cost Basic tier with real-time Forex,
+8 API credits per minute (800 per day), and 8 trial WebSocket credits. This
+still requires an account/API key, is quota-limited, and availability and
+permitted use are governed by the provider's terms. Without a configured key,
 the adapter stays unavailable and the app must not produce directional signals.
-If an operator has separately licensed access, refresh the provider's Forex
-catalog with `POST /api/v1/provider/twelvedata/catalog`, then request up to
-5,000 provider historical candles with
+Refresh the provider's Forex catalog with
+`POST /api/v1/provider/twelvedata/catalog`, then request up to 5,000 provider
+historical candles with
 `POST /api/v1/history/twelvedata?symbol=EUR%2FUSD&interval_seconds=60`.
 Twelve Data's WebSocket price endpoint is relayed at
 `/api/v1/stream?symbol=EUR%2FUSD`. It records provider ticks and forms 1-second
 and 1-minute live candles. Provider plan limits, permitted instruments, and
 latency still apply; the app never labels these prices as Pocket Option quotes.
+
+### Dukascopy historical data (TESTING preparation)
+
+Dukascopy's public hourly tick archive can be requested without an API key.
+The backend supports EUR/USD, GBP/USD, USD/JPY, USD/CHF, USD/CAD, AUD/USD, and
+NZD/USD. List supported symbols and locally imported coverage with
+`GET /api/v1/history/dukascopy/instruments`. Import at most three consecutive
+UTC hours per request:
+
+```sh
+curl -X POST 'https://your-backend/api/v1/history/dukascopy/import?symbol=EUR%2FUSD&date=2025-01-02&start_hour=0&end_hour=3&interval_seconds=1'
+```
+
+`end_hour` is exclusive; `24` can be used for a range ending at UTC midnight,
+but each request may span no more than three hours. Requests are sequential.
+HTTP 429 receives at most two retries, uses `Retry-After` when supplied, and
+stops rather than retrying early if the requested wait exceeds 30 seconds.
+Missing files (HTTP 404) and intervals are not filled or interpolated. The
+archive uses compressed binary `.bi5` tick files; the backend validates their
+record structure, time order, bid/ask values, and volumes. It saves raw ticks
+separately at their 1 ms timestamp resolution and separately creates candles
+at the requested interval. Read raw ticks through
+`GET /api/v1/history/dukascopy/ticks`; candle responses include their source
+time resolution. The Android TESTING screen can import 1, 3, or 7 UTC calendar
+days in sequential three-hour requests and reports downloaded/saved ticks,
+candles, missing files, and gaps. It does not substitute candles for stored
+ticks.
+
+Run historical tests for a selected period and one or more expirations with
+`GET /api/v1/backtest/dukascopy?symbol=EUR%2FUSD&period_days=1&expiry_seconds=60&expiry_seconds=300`.
+The response includes the candle resolution, counts and gaps plus trade,
+win/loss, and Win Rate results for each expiration. 5–30 second expirations
+are offered only when one-second candles derived from real ticks are present;
+minute candles only support minute-aligned expirations of at least one minute.
+The backtest uses a chronological holdout, forms each signal only from
+completed candles before entry, and enters at the next candle's open. It reports
+insufficient data/signals without inventing a Win Rate. Bid-only candle results
+are not adjusted for spread, commission, or slippage and must not be interpreted
+as cost-adjusted or live performance. Gap counts include market closures and
+weekends; there is no Forex trading-hours calendar filter.
+
+This is historical data for the TESTING/backtest stage, not a live feed. The
+archive can have missing hours and access/rate limits; a recent request returned
+HTTP 429, so successful real-file ingestion is not currently confirmed. Its bid
+candles do not include spread in the stored OHLC. It must not be presented as a
+free ONLINE quote stream or as Pocket Option OTC data.
+
+### HistData public M1 archives (TESTING)
+
+HistData publishes downloadable Generic ASCII M1 ZIP archives without an API
+key. The backend downloads annual archives for the seven supported pairs using
+the provider's public page/form flow, validates the ZIP and every OHLC row, and
+saves idempotently as `provider=HistData`, `interval_seconds=60`, and
+`source_resolution_ms=60000`. The CSV timestamps are fixed EST (UTC-5) without
+daylight-saving changes; conversion to UTC uses that fixed offset. These are
+bid-only minute bars, not tick data.
+
+At backend startup the historical worker checks the provider's actual full-year
+archive listing. It downloads the newest available complete year first, then
+continues backward one year per pair and cycle to resume a persistent backfill.
+The newest complete annual archive is rechecked weekly; a newly published full
+year is detected from the listing. HistData has offered complete M1 years
+2000–2025 for EUR/USD, GBP/USD, USD/JPY, USD/CHF, USD/CAD, and AUD/USD, and
+2005–2025 for NZD/USD at the time checked. The public page also lists partial
+current-year monthly archives, but those were not verifiably downloadable
+through the automated form flow and are not treated as an update source.
+
+`GET /api/v1/history/instruments` reports source-specific coverage and
+resolutions. `GET /api/v1/backtest/history` uses the latest available historical date as the
+end of the selected period, so stale archives can still be tested without being
+mislabeled as current. M1-only history allows minute-aligned expirations of at
+least 60 seconds; second-based expirations require actual one-second candles
+derived from imported Dukascopy ticks. HistData does not provide a free keyless
+ONLINE quote stream.
+
+For genuinely keyless data, [Frankfurter](https://www.frankfurter.dev/) offers
+historical reference rates derived from central-bank sources. At backend
+startup, a background job automatically retrieves and stores history from
+1999 onward for the seven supported pairs, then refreshes the recent range
+twice daily. Its values are daily reference observations, stored separately
+from candles and ticks, and are not suitable for intraday TESTING, short
+expirations, or ONLINE signals. Read coverage using
+`GET /api/v1/history/reference/instruments` and rates using
+`GET /api/v1/history/reference?symbol=EUR%2FUSD`.
+
+The backend also makes a bounded automatic Dukascopy scan of recent hourly
+files and advances its per-pair scan cursor after successful requests; the
+Android TESTING importer can request a selected recent period. Dukascopy
+returned HTTP 429 during the last real check, so a successful real tick file
+has not yet been downloaded in this environment. No requests bypass its rate
+limits. Check provider and synchronization state at
+`GET /api/v1/sources/status`.
 
 Import licensed historical CSV data at `POST /api/v1/history/import` using the
 columns `timestamp,open,high,low,close` and optional `volume`. Timestamps should
@@ -100,9 +212,12 @@ not interpolated. Historical and live candles are stored and queried separately.
 `POST /api/v1/analyze` only emits a directional signal when the current tick is
 fresh, the observed stream rate is adequate, the technical candidate is strong,
 and an active model has passed temporal validation. Otherwise it records and
-returns `NO_SIGNAL`, with no invented probabilities. The current backtest
-(`GET /api/v1/backtest`) uses a chronological holdout on 1-minute candles and
-explicitly rejects sub-minute expirations. It does not validate seconds.
+returns `NO_SIGNAL`, with no invented probabilities. ONLINE uses the existing
+Twelve Data WebSocket only when the backend operator supplies its provider API
+key. There is no verified public keyless Forex source with a trading-grade
+update frequency; the daily reference-rate source is never used as a live-feed
+fallback. `/api/v1/sources/status` reports the latest quote and why ONLINE is
+unavailable.
 
 Session, result, and statistics APIs are `POST/GET /api/v1/sessions`,
 `POST /api/v1/sessions/{id}/finish`, `GET /api/v1/signals`,
@@ -112,6 +227,10 @@ requires at least 150 labeled outcomes, fits on the oldest 60%, calibrates on
 the next 20%, and validates on the newest 20%. It requires 25 additional
 outcomes before retraining an active model and does not activate a candidate
 that fails the holdout or same-holdout comparison.
+
+The minute-candle backtest generates each decision from candles completed
+before the entry candle and evaluates entry at that next candle's open, avoiding
+use of the entry candle's close when forming its signal.
 
 This backend currently has no authentication or TLS termination; run it only
 behind a trusted private network/reverse proxy. Never expose the development
@@ -124,39 +243,40 @@ unverified for the deployment environment.
 
 ## Data-source plan
 
-- Frankfurter's no-key API was reachable during verification and provides
-  official-source reference exchange rates and daily history, not intraday
-  OHLC or executable/live quotes. It is not suitable for these short expirations
-  and is not used to create candles or signals.
-- A no-key Dukascopy hourly tick archive returned binary data in one probe, but
-  a repeat request timed out. Its binary ingestion, coverage, license terms, and
-  ongoing availability have not been validated; it is not wired into the app.
+- Frankfurter's no-key API provides official-source daily reference rates and
+  historical series. Backend startup synchronization stores these in a
+  dedicated table and API, never as synthetic candles or live prices.
+- Dukascopy exposes public hourly `.bi5` archive URLs without an API-key
+  parameter, but a recent real request returned HTTP 429. The backend now has a
+  bounded, `Retry-After`-aware retry policy, automatic bounded scans, raw tick
+  storage, and small-range imports; successful real-file ingestion remains
+  unverified until the provider permits a request.
 - The existing Twelve Data adapter supports catalog/history/WebSocket only when
-  separately configured with a key. No key is requested from the user, and no
-  live quote provider without registration has been verified for production use.
+  the backend operator configures a provider key. Its current Basic tier lists
+  limited free real-time Forex access, but still requires registration/API key;
+  no keyless live quote provider has been verified for production use.
 - OTC live data: unavailable until an authorized Pocket Option-compatible source
   and instrument catalog are confirmed.
 
-Historical prices are for research and backtesting, not live trading. Second-based
-expirations will only be analyzed when the live tick rate and timestamps support
-them; minute candles are not a substitute.
+Historical prices are for research and backtesting, not live trading.
+Second-based expirations require actual one-second historical candles created
+from real source ticks; minute and daily reference observations are not
+substitutes. Render Free uses an ephemeral filesystem, so downloaded history
+and application records can be lost on restart, redeploy, or spin-down.
 
 ## Release automation and deployment blockers
 
 The Android release workflow runs backend tests, Android lint/unit-test tasks,
 builds a signed APK, stores it as a workflow artifact, and attaches it to a
-tagged GitHub Release. It intentionally fails until the repository has a
-`SERVER_BASE_URL` variable containing the deployed HTTPS API and these Actions
-secrets: `RELEASE_KEYSTORE_BASE64`, `RELEASE_STORE_PASSWORD`,
+tagged GitHub Release. It uses the repository's `SERVER_BASE_URL` variable when
+set, otherwise the configured Render URL. Release signing still requires these
+Actions secrets: `RELEASE_KEYSTORE_BASE64`, `RELEASE_STORE_PASSWORD`,
 `RELEASE_KEY_ALIAS`, and `RELEASE_KEY_PASSWORD`. The keystore is never stored
 in the repository.
 
-There is no deployed API address configured in this repository. A free Render
-web service is not suitable as a permanent live-quote server: its free service
-spins down after 15 minutes without inbound traffic and loses local files on
-restart/spin-down; its free PostgreSQL database expires after 30 days. See
-[Render free-instance limits](https://render.com/docs/free). Creating a real
-internet deployment also requires authorization to an external hosting account
-and a persistent database choice. Until those prerequisites exist, a Release
-APK cannot be truthfully configured to auto-connect, and no downloadable public
-APK Release is available.
+The Render hostname responds to `/health`, but the currently deployed OpenAPI
+does not include the new historical routes: `/api/v1/sources/status`,
+`/api/v1/history/instruments`, and `/api/v1/backtest/history` return 404. The
+updated Backend is not published until Render syncs this Blueprint and the
+deployment is confirmed against those routes. A signed public APK Release is
+also unavailable until the signing secrets are configured.

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.market_data import Candle
+from app.dukascopy import Tick, PROVIDER_NAME as DUKASCOPY_PROVIDER
 
 
 CSV_COLUMNS = {"timestamp", "open", "high", "low", "close"}
@@ -20,6 +21,82 @@ class ImportReport:
     duplicate_rows: int
     missing_intervals: int
     interval_seconds: int
+
+
+def save_historical_candles(
+    connection: sqlite3.Connection,
+    candles: list[Candle] | tuple[Candle, ...],
+    *,
+    provider: str,
+    symbol: str,
+    interval_seconds: int,
+    source_resolution_ms: int | None = None,
+) -> int:
+    if source_resolution_ms is not None and source_resolution_ms <= 0:
+        raise ValueError("Source resolution must be positive")
+    cursor = connection.executemany(
+        """
+        INSERT INTO candles (
+            provider, market_type, symbol, interval_seconds, source_resolution_ms,
+            timestamp_ms,
+            open, high, low, close, volume, data_kind
+        ) VALUES (?, 'CLASSIC', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'HISTORICAL')
+        ON CONFLICT (provider, symbol, interval_seconds, timestamp_ms, data_kind)
+        DO NOTHING
+        """,
+        [
+            (
+                provider,
+                symbol,
+                interval_seconds,
+                source_resolution_ms,
+                candle.timestamp_ms,
+                candle.open,
+                candle.high,
+                candle.low,
+                candle.close,
+                candle.volume,
+            )
+            for candle in candles
+        ],
+    )
+    return cursor.rowcount
+
+
+def save_historical_ticks(
+    connection: sqlite3.Connection,
+    ticks: list[Tick] | tuple[Tick, ...],
+    *,
+    symbol: str,
+) -> int:
+    if not ticks:
+        return 0
+    timestamp_sequences: dict[int, int] = {}
+    rows: list[tuple[str, str, int, int, float, float]] = []
+    for tick in ticks:
+        sequence = timestamp_sequences.get(tick.timestamp_ms, 0)
+        timestamp_sequences[tick.timestamp_ms] = sequence + 1
+        rows.append(
+            (
+                DUKASCOPY_PROVIDER,
+                symbol,
+                tick.timestamp_ms,
+                sequence,
+                tick.bid,
+                tick.ask,
+            )
+        )
+    cursor = connection.executemany(
+        """
+        INSERT INTO market_ticks (
+            provider, symbol, timestamp_ms, tick_sequence,
+            timestamp_resolution_ms, bid, ask
+        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT (provider, symbol, timestamp_ms, tick_sequence) DO NOTHING
+        """,
+        rows,
+    )
+    return cursor.rowcount
 
 
 def _timestamp_ms(value: str) -> int:
@@ -90,31 +167,13 @@ def import_historical_csv(
         )
 
     with connection:
-        cursor = connection.executemany(
-            """
-            INSERT INTO candles (
-                provider, market_type, symbol, interval_seconds, timestamp_ms,
-                open, high, low, close, volume, data_kind
-            ) VALUES (?, 'CLASSIC', ?, ?, ?, ?, ?, ?, ?, ?, 'HISTORICAL')
-            ON CONFLICT (provider, symbol, interval_seconds, timestamp_ms, data_kind)
-            DO NOTHING
-            """,
-            [
-                (
-                    provider,
-                    symbol,
-                    interval_seconds,
-                    candle.timestamp_ms,
-                    candle.open,
-                    candle.high,
-                    candle.low,
-                    candle.close,
-                    candle.volume,
-                )
-                for candle in candles
-            ],
+        inserted = save_historical_candles(
+            connection,
+            candles,
+            provider=provider,
+            symbol=symbol,
+            interval_seconds=interval_seconds,
         )
-        inserted = cursor.rowcount
 
     return ImportReport(
         rows_read=rows_read,

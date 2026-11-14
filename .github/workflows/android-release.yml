@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      SERVER_BASE_URL: ${{ vars.SERVER_BASE_URL }}
+      SERVER_BASE_URL: ${{ vars.SERVER_BASE_URL || 'https://pocket-signal-assistant.onrender.com' }}
       RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
       ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.RELEASE_STORE_PASSWORD }}
       ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.RELEASE_KEY_ALIAS }}
@@ -42,12 +42,35 @@ jobs:
       - name: Install Android SDK 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
+      - name: Build debug APK
+        run: |
+          ./gradlew --no-daemon --no-watch-fs --max-workers=2 \
+            lintDebug testDebugUnitTest assembleDebug \
+            -PapiBaseUrl="$SERVER_BASE_URL"
+
+      - name: Verify debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest application-id "$APK"
+          cp "$APK" PocketSignal-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocketSignal-debug-apk
+          path: PocketSignal-debug.apk
+          if-no-files-found: error
+
       - name: Validate release configuration
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           set -euo pipefail
           [[ "$SERVER_BASE_URL" == https://* ]] || {
-            echo "Configure the SERVER_BASE_URL repository variable with the deployed HTTPS API."
+            echo "SERVER_BASE_URL must contain the deployed HTTPS API."
             exit 1
           }
           test -n "$RELEASE_KEYSTORE_BASE64"
@@ -57,6 +80,7 @@ jobs:
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ORG_GRADLE_PROJECT_releaseStoreFile"
 
       - name: Build signed release APK
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           ./gradlew --no-daemon --no-watch-fs --max-workers=2 \
             lintDebug testDebugUnitTest \
@@ -64,6 +88,7 @@ jobs:
             -PreleaseApiBaseUrl="$SERVER_BASE_URL"
 
       - name: Verify APK and server configuration
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           set -euo pipefail
@@ -74,6 +99,7 @@ jobs:
           cp "$APK" PocketSignal-release.apk
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: PocketSignal-release-apk
           path: PocketSignal-release.apk
