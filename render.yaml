@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pocket-signal-api
+    name: pocket-signal-assistant
     runtime: docker
     plan: free
     region: oregon

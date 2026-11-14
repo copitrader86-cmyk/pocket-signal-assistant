@@ -47,6 +47,12 @@ environment variable, Render restarts the service, which refreshes the
 Twelve Data Forex catalog at startup. Do not put the key in `render.yaml`,
 the Android app, or source control. Enter it only in the Render dashboard.
 
+For automated Render deployments from GitHub, add two secret values in the
+repository settings: `RENDER_API_KEY` (Render API key) and
+`RENDER_SERVICE_ID` (the existing service ID, such as the current Render web
+service ID). The workflow in `.github/workflows/render-deploy.yml` reads these
+values and triggers a deploy without exposing the secrets in code or logs.
+
 Render Free has an ephemeral filesystem. SQLite data, including downloaded
 HistData candles and sync cursors, can be lost when the service restarts,
 redeploys, or spins down. The local development database is not copied to

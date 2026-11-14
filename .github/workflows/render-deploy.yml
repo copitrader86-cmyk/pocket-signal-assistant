@@ -1,0 +1,32 @@
+name: Render deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy Pocket Signal Assistant to Render
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy service
+        shell: bash
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "${RENDER_API_KEY}" ]] || {
+            echo "Missing GitHub secret: RENDER_API_KEY"
+            exit 1
+          }
+          [[ -n "${RENDER_SERVICE_ID}" ]] || {
+            echo "Missing GitHub secret: RENDER_SERVICE_ID"
+            exit 1
+          }
+          curl -fsS -X POST "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/deploys" \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache":"false"}'

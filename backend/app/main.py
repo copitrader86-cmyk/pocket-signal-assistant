@@ -44,6 +44,7 @@ from app.market_data import (
     PROVIDER_NAME,
     MarketDataError,
     TwelveDataClient,
+    has_twelve_data_api_key,
     normalize_symbol,
 )
 from app.reference_data import (
@@ -653,12 +654,18 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             if automatic_sync
             else []
         )
-        if automatic_sync and os.getenv("TWELVE_DATA_API_KEY"):
+        if automatic_sync and has_twelve_data_api_key():
             sync_tasks.append(
                 asyncio.create_task(
                     _sync_twelvedata_catalog(resolved_database_path),
                     name="twelvedata-catalog-sync",
                 )
+            )
+        if has_twelve_data_api_key():
+            logger.info("Twelve Data provider is configured and ready for catalog sync")
+        else:
+            logger.warning(
+                "Twelve Data provider is not configured; set TWELVE_DATA_API_KEY before deployment"
             )
         try:
             yield
@@ -986,7 +993,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             """,
             online_parameters,
         ).fetchone()
-        key_configured = bool(os.getenv("TWELVE_DATA_API_KEY"))
+        key_configured = has_twelve_data_api_key()
         age_ms = (
             max(0, now_ms - latest_tick["timestamp_ms"])
             if latest_tick is not None
@@ -2220,7 +2227,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             return
 
         api_key = os.getenv("TWELVE_DATA_API_KEY")
-        if not api_key:
+        if not has_twelve_data_api_key(api_key):
             await websocket.send_json(
                 {"error": "Live stream is unavailable: TWELVE_DATA_API_KEY is not configured"}
             )

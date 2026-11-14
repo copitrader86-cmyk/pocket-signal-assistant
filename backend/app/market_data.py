@@ -58,6 +58,11 @@ def parse_provider_timestamp(value: str) -> int:
     return int(timestamp.timestamp() * 1000)
 
 
+def has_twelve_data_api_key(api_key: str | None = None) -> bool:
+    value = api_key if api_key is not None else os.getenv("TWELVE_DATA_API_KEY")
+    return isinstance(value, str) and value.strip() != ""
+
+
 class TwelveDataClient:
     def __init__(
         self,
