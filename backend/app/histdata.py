@@ -1,3 +1,4 @@
+import asyncio
 import io
 import math
 import re
@@ -139,6 +140,28 @@ def parse_m1_csv(text: str, *, symbol: str, year: int) -> HistDataBatch:
     )
 
 
+def _read_archive_csv(archive_bytes: bytes, expected_name: str) -> str:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            members = [
+                item
+                for item in archive.infolist()
+                if PurePosixPath(item.filename).name == expected_name
+                and not item.is_dir()
+            ]
+            if len(members) != 1 or members[0].file_size > MAX_CSV_BYTES:
+                raise MarketDataError("HistData ZIP has no unique, bounded M1 data file")
+            if members[0].filename != PurePosixPath(members[0].filename).name:
+                raise MarketDataError("HistData ZIP contains an unsafe data-file path")
+            with archive.open(members[0]) as data_file:
+                csv_text = data_file.read(MAX_CSV_BYTES + 1).decode("ascii")
+    except (OSError, UnicodeDecodeError, zipfile.BadZipFile, RuntimeError) as error:
+        raise MarketDataError("HistData ZIP is invalid or its CSV is unreadable") from error
+    if len(csv_text.encode("ascii")) > MAX_CSV_BYTES:
+        raise MarketDataError("HistData CSV exceeds the decompressed size limit")
+    return csv_text
+
+
 class HistDataClient:
     def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
         self._client = client
@@ -236,22 +259,7 @@ class HistDataClient:
             raise MarketDataError("HistData download was not a ZIP archive")
 
         expected_name = f"DAT_ASCII_{pair}_M1_{year}.csv"
-        try:
-            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-                members = [
-                    item
-                    for item in archive.infolist()
-                    if PurePosixPath(item.filename).name == expected_name
-                    and not item.is_dir()
-                ]
-                if len(members) != 1 or members[0].file_size > MAX_CSV_BYTES:
-                    raise MarketDataError("HistData ZIP has no unique, bounded M1 data file")
-                if members[0].filename != PurePosixPath(members[0].filename).name:
-                    raise MarketDataError("HistData ZIP contains an unsafe data-file path")
-                with archive.open(members[0]) as data_file:
-                    csv_text = data_file.read(MAX_CSV_BYTES + 1).decode("ascii")
-        except (OSError, UnicodeDecodeError, zipfile.BadZipFile, RuntimeError) as error:
-            raise MarketDataError("HistData ZIP is invalid or its CSV is unreadable") from error
-        if len(csv_text.encode("ascii")) > MAX_CSV_BYTES:
-            raise MarketDataError("HistData CSV exceeds the decompressed size limit")
-        return parse_m1_csv(csv_text, symbol=symbol, year=year)
+        csv_text = await asyncio.to_thread(
+            _read_archive_csv, response.content, expected_name
+        )
+        return await asyncio.to_thread(parse_m1_csv, csv_text, symbol=symbol, year=year)

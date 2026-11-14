@@ -208,6 +208,38 @@ def _persist_histdata_batch(database_path: Path, batch: HistDataBatch) -> int:
         connection.close()
 
 
+def _histdata_sync_state(
+    database_path: Path, symbol: str
+) -> tuple[tuple[int | None, int | None] | None, int | None]:
+    connection = connect(database_path)
+    try:
+        sync_row = connection.execute(
+            """
+            SELECT last_scanned_timestamp_ms, last_success_at_ms
+            FROM public_history_sync
+            WHERE provider = ? AND symbol = ?
+            """,
+            (HISTDATA_PROVIDER, symbol),
+        ).fetchone()
+        latest_row = connection.execute(
+            """
+            SELECT MAX(timestamp_ms) AS latest_timestamp_ms
+            FROM candles
+            WHERE provider = ? AND symbol = ? AND interval_seconds = 60
+                AND data_kind = 'HISTORICAL'
+            """,
+            (HISTDATA_PROVIDER, symbol),
+        ).fetchone()
+        return (
+            (sync_row["last_scanned_timestamp_ms"], sync_row["last_success_at_ms"])
+            if sync_row
+            else None,
+            latest_row["latest_timestamp_ms"],
+        )
+    finally:
+        connection.close()
+
+
 async def _sync_public_reference_history(database_path: Path) -> None:
     while True:
         end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
@@ -275,41 +307,21 @@ async def _sync_histdata_history(database_path: Path) -> None:
             try:
                 async with HistDataClient() as provider:
                     years = await provider.available_years(symbol)
-                    connection = connect(database_path)
-                    try:
-                        sync_row = connection.execute(
-                            """
-                            SELECT last_scanned_timestamp_ms, last_success_at_ms
-                            FROM public_history_sync
-                            WHERE provider = ? AND symbol = ?
-                            """,
-                            (HISTDATA_PROVIDER, symbol),
-                        ).fetchone()
-                        latest_row = connection.execute(
-                            """
-                            SELECT MAX(timestamp_ms) AS latest_timestamp_ms
-                            FROM candles
-                            WHERE provider = ? AND symbol = ? AND interval_seconds = 60
-                                AND data_kind = 'HISTORICAL'
-                            """,
-                            (HISTDATA_PROVIDER, symbol),
-                        ).fetchone()
-                    finally:
-                        connection.close()
+                    sync_state, latest_timestamp_ms = await asyncio.to_thread(
+                        _histdata_sync_state, database_path, symbol
+                    )
 
                     newest_year = years[-1]
                     oldest_year = years[0]
                     latest_saved_year = (
                         datetime.fromtimestamp(
-                            latest_row["latest_timestamp_ms"] / 1000,
+                            latest_timestamp_ms / 1000,
                             tz=timezone(timedelta(hours=-5)),
                         ).year
-                        if latest_row["latest_timestamp_ms"] is not None
+                        if latest_timestamp_ms is not None
                         else None
                     )
-                    cursor = (
-                        sync_row["last_scanned_timestamp_ms"] if sync_row else None
-                    )
+                    cursor = sync_state[0] if sync_state else None
                     if latest_saved_year is None or latest_saved_year < newest_year:
                         target_year = newest_year
                     elif cursor is None:
@@ -321,9 +333,9 @@ async def _sync_histdata_history(database_path: Path) -> None:
                         target_year = last_year - 1 if last_year > oldest_year else None
                     elif (
                         cursor == 0
-                        and sync_row is not None
-                        and sync_row["last_success_at_ms"] is not None
-                        and now_ms - sync_row["last_success_at_ms"]
+                        and sync_state is not None
+                        and sync_state[1] is not None
+                        and now_ms - sync_state[1]
                         >= 7 * 24 * 60 * 60 * 1000
                     ):
                         target_year = newest_year
@@ -333,11 +345,17 @@ async def _sync_histdata_history(database_path: Path) -> None:
                     if target_year is None or target_year not in years:
                         continue
 
-                    _set_reference_sync_status(
-                        database_path, symbol, "loading", provider=HISTDATA_PROVIDER
+                    await asyncio.to_thread(
+                        _set_reference_sync_status,
+                        database_path,
+                        symbol,
+                        "loading",
+                        provider=HISTDATA_PROVIDER,
                     )
                     batch = await provider.fetch_year(symbol, target_year)
-                    inserted = _persist_histdata_batch(database_path, batch)
+                    inserted = await asyncio.to_thread(
+                        _persist_histdata_batch, database_path, batch
+                    )
                     scan_cursor = (
                         0
                         if target_year == oldest_year or cursor == 0
@@ -348,7 +366,8 @@ async def _sync_histdata_history(database_path: Path) -> None:
                             * 1000
                         )
                     )
-                    _set_reference_sync_status(
+                    await asyncio.to_thread(
+                        _set_reference_sync_status,
                         database_path,
                         symbol,
                         "ready",
@@ -366,7 +385,8 @@ async def _sync_histdata_history(database_path: Path) -> None:
                         batch.missing_intervals,
                     )
             except (MarketDataError, sqlite3.Error, ValueError) as error:
-                _set_reference_sync_status(
+                await asyncio.to_thread(
+                    _set_reference_sync_status,
                     database_path,
                     symbol,
                     "error",
@@ -453,7 +473,8 @@ async def _sync_recent_dukascopy_history(database_path: Path) -> None:
                         end_hour=end_hour,
                         interval_seconds=1,
                     )
-                _persist_dukascopy_batch(
+                await asyncio.to_thread(
+                    _persist_dukascopy_batch,
                     database_path,
                     batch,
                     interval_seconds=1,
@@ -663,19 +684,45 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def dukascopy_instruments(
         connection: Annotated[sqlite3.Connection, Depends(get_connection)],
     ) -> dict[str, object]:
-        coverage = {
-            row["symbol"]: dict(row)
-            for row in connection.execute(
-                """
-                SELECT symbol, MIN(timestamp_ms) AS first_timestamp_ms,
-                    MAX(timestamp_ms) AS last_timestamp_ms, COUNT(*) AS candles_count
-                FROM candles
-                WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
-                GROUP BY symbol
-                """,
-                (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
-            ).fetchall()
-        }
+        coverage: dict[str, dict[str, int]] = {}
+        interval_coverage: dict[str, set[int]] = {}
+        source_intervals: dict[tuple[str, str], set[int]] = {}
+        source_resolutions: dict[str, set[int]] = {}
+        for row in connection.execute(
+            """
+            SELECT symbol, provider, interval_seconds, source_resolution_ms,
+                MIN(timestamp_ms) AS first_timestamp_ms,
+                MAX(timestamp_ms) AS last_timestamp_ms, COUNT(*) AS candles_count
+            FROM candles
+            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+            GROUP BY symbol, provider, interval_seconds, source_resolution_ms
+            """,
+            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
+        ):
+            symbol = row["symbol"]
+            summary = coverage.setdefault(
+                symbol,
+                {
+                    "first_timestamp_ms": row["first_timestamp_ms"],
+                    "last_timestamp_ms": row["last_timestamp_ms"],
+                    "candles_count": 0,
+                },
+            )
+            summary["first_timestamp_ms"] = min(
+                summary["first_timestamp_ms"], row["first_timestamp_ms"]
+            )
+            summary["last_timestamp_ms"] = max(
+                summary["last_timestamp_ms"], row["last_timestamp_ms"]
+            )
+            summary["candles_count"] += row["candles_count"]
+            interval_coverage.setdefault(symbol, set()).add(row["interval_seconds"])
+            source_intervals.setdefault((symbol, row["provider"]), set()).add(
+                row["interval_seconds"]
+            )
+            if row["source_resolution_ms"] is not None:
+                source_resolutions.setdefault(symbol, set()).add(
+                    row["source_resolution_ms"]
+                )
         tick_coverage = {
             row["symbol"]: dict(row)
             for row in connection.execute(
@@ -690,46 +737,6 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 (DUKASCOPY_PROVIDER,),
             ).fetchall()
         }
-        interval_coverage: dict[str, set[int]] = {}
-        for row in connection.execute(
-            """
-            SELECT symbol, interval_seconds
-            FROM candles
-            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
-            GROUP BY symbol, interval_seconds
-            """,
-            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
-        ):
-            interval_coverage.setdefault(row["symbol"], set()).add(
-                row["interval_seconds"]
-            )
-        source_intervals: dict[tuple[str, str], set[int]] = {}
-        for row in connection.execute(
-            """
-            SELECT symbol, provider, interval_seconds
-            FROM candles
-            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
-            GROUP BY symbol, provider, interval_seconds
-            """,
-            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
-        ):
-            source_intervals.setdefault((row["symbol"], row["provider"]), set()).add(
-                row["interval_seconds"]
-            )
-        source_resolutions: dict[str, set[int]] = {}
-        for row in connection.execute(
-            """
-            SELECT symbol, source_resolution_ms
-            FROM candles
-            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
-                AND source_resolution_ms IS NOT NULL
-            GROUP BY symbol, source_resolution_ms
-            """,
-            (DUKASCOPY_PROVIDER, HISTDATA_PROVIDER),
-        ):
-            source_resolutions.setdefault(row["symbol"], set()).add(
-                row["source_resolution_ms"]
-            )
         return {
             "provider": f"{HISTDATA_PROVIDER} / {DUKASCOPY_PROVIDER}",
             "instruments": [

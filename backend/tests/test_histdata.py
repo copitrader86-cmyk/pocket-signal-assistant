@@ -1,6 +1,7 @@
 import asyncio
 import io
 import threading
+import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,56 @@ def test_histdata_fetch_uses_official_annual_form_and_decodes_archive() -> None:
     assert batch.symbol == "EUR/USD"
     assert batch.rows_read == 2
     assert len(batch.candles) == 2
+
+
+def test_histdata_archive_processing_keeps_event_loop_responsive(monkeypatch) -> None:
+    csv_text = "20240101 170000;1.10000;1.10020;1.09990;1.10010;0\n"
+    ticks = [0]
+    ticks_during_parse: list[int] = []
+    original_parser = parse_m1_csv
+
+    def slow_parser(text: str, *, symbol: str, year: int):
+        ticks_before_parse = ticks[0]
+        time.sleep(0.1)
+        ticks_during_parse.append(ticks[0] - ticks_before_parse)
+        return original_parser(text, symbol=symbol, year=year)
+
+    monkeypatch.setattr("app.histdata.parse_m1_csv", slow_parser)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=(
+                    '<form id="file_down"><input name="tk" value="token">'
+                    '<input name="date" value="2024">'
+                    '<input name="datemonth" value="2024">'
+                    '<input name="platform" value="ASCII">'
+                    '<input name="timeframe" value="M1">'
+                    '<input name="fxpair" value="EURUSD"></form>'
+                ),
+            )
+        return httpx.Response(200, content=_archive("EURUSD", 2024, csv_text))
+
+    async def exercise() -> None:
+        async def fetch() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler),
+                base_url="https://www.histdata.com",
+            ) as http:
+                async with HistDataClient(client=http) as provider:
+                    await provider.fetch_year("EUR/USD", 2024)
+
+        async def ticker() -> None:
+            while not ticks_during_parse:
+                ticks[0] += 1
+                await asyncio.sleep(0.005)
+
+        await asyncio.gather(fetch(), ticker())
+
+    asyncio.run(exercise())
+
+    assert ticks_during_parse[0] > 0
 
 
 def test_available_years_only_returns_full_year_archives() -> None:

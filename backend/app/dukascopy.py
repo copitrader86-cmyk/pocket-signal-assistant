@@ -230,7 +230,8 @@ class DukascopyClient:
             ).timestamp()
             * 1000
         )
-        return parse_bi5(
+        return await asyncio.to_thread(
+            parse_bi5,
             response.content,
             hour_start_ms=hour_start_ms,
             price_scale=_price_scale(symbol),
@@ -269,7 +270,12 @@ class DukascopyClient:
             if len(ticks) > MAX_TICKS_PER_REQUEST:
                 raise MarketDataError("Dukascopy request exceeds the 2 million tick limit")
 
-        candles = _aggregate_bid_candles(ticks, interval_seconds)
+        candles = await asyncio.to_thread(
+            _aggregate_bid_candles, ticks, interval_seconds
+        )
+        missing_intervals = await asyncio.to_thread(
+            _missing_intervals, candles, interval_seconds
+        )
         return HistoricalBatch(
             symbol=symbol,
             date=trading_date,
@@ -278,7 +284,7 @@ class DukascopyClient:
             files_requested=end_hour - start_hour,
             files_missing=files_missing,
             ticks_received=len(ticks),
-            missing_intervals=_missing_intervals(candles, interval_seconds),
+            missing_intervals=missing_intervals,
             candles=candles,
             ticks=tuple(ticks),
         )

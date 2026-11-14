@@ -144,6 +144,50 @@ def test_dukascopy_fetch_uses_utc_path_and_reports_missing_files() -> None:
     assert "/2025/00/02/1h_ticks.bi5" in requested_urls[0]
 
 
+def test_dukascopy_file_parsing_keeps_event_loop_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = [0]
+    ticks_during_parse: list[int] = []
+    original_parser = parse_bi5
+
+    def slow_parser(
+        payload: bytes, *, hour_start_ms: int, price_scale: int
+    ) -> list[Tick]:
+        ticks_before_parse = ticks[0]
+        time.sleep(0.1)
+        ticks_during_parse.append(ticks[0] - ticks_before_parse)
+        return original_parser(
+            payload, hour_start_ms=hour_start_ms, price_scale=price_scale
+        )
+
+    monkeypatch.setattr("app.dukascopy.parse_bi5", slow_parser)
+
+    async def exercise() -> None:
+        async def fetch() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda _: httpx.Response(
+                        200,
+                        content=_bi5([(0, 110_010, 110_000, 1.0, 1.0)]),
+                    )
+                )
+            ) as http:
+                async with DukascopyClient(client=http) as provider:
+                    await provider.fetch_hour("EUR/USD", date(2025, 1, 2), 0)
+
+        async def ticker() -> None:
+            while not ticks_during_parse:
+                ticks[0] += 1
+                await asyncio.sleep(0.005)
+
+        await asyncio.gather(fetch(), ticker())
+
+    asyncio.run(exercise())
+
+    assert ticks_during_parse[0] > 0
+
+
 def test_dukascopy_retries_429_then_decodes_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
