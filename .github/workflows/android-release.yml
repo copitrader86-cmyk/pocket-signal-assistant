@@ -1,0 +1,89 @@
+name: Android release APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      SERVER_BASE_URL: ${{ vars.SERVER_BASE_URL }}
+      RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+      ORG_GRADLE_PROJECT_releaseStorePassword: ${{ secrets.RELEASE_STORE_PASSWORD }}
+      ORG_GRADLE_PROJECT_releaseKeyAlias: ${{ secrets.RELEASE_KEY_ALIAS }}
+      ORG_GRADLE_PROJECT_releaseKeyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      ORG_GRADLE_PROJECT_releaseStoreFile: ${{ runner.temp }}/pocket-signal-release.jks
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test backend
+        run: |
+          python -m pip install -e "backend[test]"
+          python -m pytest -q backend/tests
+
+      - name: Install Android SDK 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Validate release configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SERVER_BASE_URL" == https://* ]] || {
+            echo "Configure the SERVER_BASE_URL repository variable with the deployed HTTPS API."
+            exit 1
+          }
+          test -n "$RELEASE_KEYSTORE_BASE64"
+          test -n "$ORG_GRADLE_PROJECT_releaseStorePassword"
+          test -n "$ORG_GRADLE_PROJECT_releaseKeyAlias"
+          test -n "$ORG_GRADLE_PROJECT_releaseKeyPassword"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$ORG_GRADLE_PROJECT_releaseStoreFile"
+
+      - name: Build signed release APK
+        run: |
+          ./gradlew --no-daemon --no-watch-fs --max-workers=2 \
+            lintDebug testDebugUnitTest \
+            assembleRelease \
+            -PreleaseApiBaseUrl="$SERVER_BASE_URL"
+
+      - name: Verify APK and server configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$APK"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest application-id "$APK"
+          cp "$APK" PocketSignal-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocketSignal-release-apk
+          path: PocketSignal-release.apk
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" PocketSignal-release.apk --clobber

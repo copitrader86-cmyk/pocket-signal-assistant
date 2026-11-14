@@ -1,0 +1,454 @@
+import sqlite3
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import pytest
+import httpx
+from fastapi.testclient import TestClient
+
+from app.database import connect, initialize_database
+from app.historical_import import import_historical_csv
+from app.learning import MINIMUM_LABELED_SIGNALS, predict_win_probability, train_model
+from app.main import _store_live_tick, create_app
+from app.analytics import analyze_candles
+from app.backtesting import BacktestError, run_backtest
+from app.market_data import Candle, MarketDataError, TwelveDataClient
+
+
+def test_health_initializes_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "nested" / "signals.db"
+
+    with TestClient(create_app(database_path)) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+    assert isinstance(response.json()["server_time_ms"], int)
+    assert database_path.exists()
+
+
+def test_catalog_does_not_claim_unconfigured_markets(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.get("/api/v1/catalog")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "instruments": [],
+        "classic_available": False,
+        "otc_available": False,
+    }
+
+
+def test_database_schema_rejects_unsupported_expiration(tmp_path: Path) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                """
+                INSERT INTO signals (
+                    id, provider, market_type, symbol, direction, expiry_seconds,
+                    issued_at_ms, expires_at_ms, quote_timestamp_ms, quote_latency_ms,
+                    market_snapshot_json, analytics_json, explanation
+                ) VALUES (
+                    's1', 'provider', 'CLASSIC', 'EUR/USD', 'UP', 7,
+                    1000, 8000, 1000, 0, '{}', '{}', 'test'
+                )
+                """
+            )
+
+
+def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO signals (
+                id, provider, market_type, symbol, direction, expiry_seconds,
+                issued_at_ms, expires_at_ms, market_snapshot_json, analytics_json,
+                explanation
+            ) VALUES ('keep-me', 'TwelveData', 'CLASSIC', 'EUR/USD', 'NO_SIGNAL',
+                60, 1000, 61000, '{}', '{}', 'missing quote')
+            """
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        signal = connection.execute(
+            "SELECT id, quote_timestamp_ms FROM signals WHERE id = 'keep-me'"
+        ).fetchone()
+
+    assert version == 3
+    assert tuple(signal) == ("keep-me", None)
+
+
+def test_historical_csv_import_reports_gaps_and_skips_bad_rows(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    csv_text = "\n".join(
+        [
+            "timestamp,open,high,low,close,volume",
+            "2025-01-01T00:00:00Z,1.1,1.2,1.0,1.15,10",
+            "2025-01-01T00:00:00Z,1.1,1.2,1.0,1.15,10",
+            "2025-01-01T00:03:00Z,1.15,1.25,1.1,1.2,",
+            "bad-timestamp,1,1,1,1,",
+            "2025-01-01T00:04:00Z,1,0.9,1,1,",
+        ]
+    )
+
+    with connect(database_path) as connection:
+        report = import_historical_csv(
+            connection,
+            csv_text,
+            provider="Dukascopy",
+            symbol="EUR/USD",
+            interval_seconds=60,
+        )
+        repeated = import_historical_csv(
+            connection,
+            csv_text,
+            provider="Dukascopy",
+            symbol="EUR/USD",
+            interval_seconds=60,
+        )
+        count = connection.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+
+    assert report.rows_read == 5
+    assert report.rows_imported == 2
+    assert report.invalid_rows == 2
+    assert report.duplicate_rows == 1
+    assert report.missing_intervals == 2
+    assert repeated.rows_imported == 0
+    assert count == 2
+
+
+def test_twelvedata_candle_response_is_normalized_and_sorted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/time_series")
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"symbol": "EUR/USD"},
+                "values": [
+                    {
+                        "datetime": "2025-01-01 00:01:00",
+                        "open": "1.1",
+                        "high": "1.2",
+                        "low": "1.0",
+                        "close": "1.15",
+                        "volume": "",
+                    },
+                    {
+                        "datetime": "2025-01-01 00:00:00",
+                        "open": "1.0",
+                        "high": "1.1",
+                        "low": "0.9",
+                        "close": "1.05",
+                        "volume": "",
+                    },
+                ],
+            },
+        )
+
+    async def fetch() -> list[Candle]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with TwelveDataClient("test-key", client=client) as provider:
+                return await provider.time_series("EUR/USD", 60, 10)
+
+    candles = asyncio.run(fetch())
+
+    assert len(candles) == 2
+    assert candles[0].timestamp_ms < candles[1].timestamp_ms
+    assert candles[0].close == 1.05
+    assert candles[0].volume is None
+
+
+def test_twelvedata_missing_key_fails_explicitly() -> None:
+    async def fetch() -> None:
+        async with TwelveDataClient(api_key="") as provider:
+            await provider.forex_pairs()
+
+    with pytest.raises(MarketDataError, match="not configured"):
+        asyncio.run(fetch())
+
+
+def test_live_ticks_update_live_candles_without_touching_history(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        _store_live_tick(
+            connection,
+            "EUR/USD",
+            {"timestamp": 1_735_689_600, "price": "1.1"},
+        )
+        _store_live_tick(
+            connection,
+            "EUR/USD",
+            {"timestamp": 1_735_689_600.5, "price": "1.2"},
+        )
+        live = connection.execute(
+            """
+            SELECT open, high, low, close
+            FROM candles
+            WHERE provider = 'TwelveData' AND symbol = 'EUR/USD'
+                AND interval_seconds = 1 AND data_kind = 'LIVE'
+            """
+        ).fetchone()
+        historical_count = connection.execute(
+            "SELECT COUNT(*) FROM candles WHERE data_kind = 'HISTORICAL'"
+        ).fetchone()[0]
+
+    assert tuple(live) == (1.1, 1.2, 1.1, 1.2)
+    assert historical_count == 0
+
+
+def test_history_api_keeps_live_and_historical_series_separate(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO candles (
+                provider, market_type, symbol, interval_seconds, timestamp_ms,
+                open, high, low, close, data_kind
+            ) VALUES ('Dukascopy', 'CLASSIC', 'EUR/USD', 60, 1000, 1, 2, 0.5, 1.5, 'HISTORICAL')
+            """
+        )
+
+    with TestClient(create_app(database_path)) as client:
+        historical = client.get(
+            "/api/v1/candles",
+            params={
+                "provider": "Dukascopy",
+                "symbol": "EUR/USD",
+                "interval_seconds": 60,
+                "data_kind": "HISTORICAL",
+            },
+        )
+        live = client.get(
+            "/api/v1/candles",
+            params={
+                "provider": "Dukascopy",
+                "symbol": "EUR/USD",
+                "interval_seconds": 60,
+                "data_kind": "LIVE",
+            },
+        )
+
+    assert len(historical.json()["candles"]) == 1
+    assert live.json()["candles"] == []
+
+
+def test_analysis_with_missing_quote_is_saved_as_no_signal_without_fake_probability(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO market_instruments (
+                provider, market_type, symbol, display_name, updated_at_ms
+            ) VALUES ('TwelveData', 'CLASSIC', 'EUR/USD', 'EUR/USD', 1)
+            """
+        )
+
+    with TestClient(create_app(database_path)) as client:
+        response = client.post(
+            "/api/v1/analyze",
+            json={
+                "symbol": "EUR/USD",
+                "market_type": "CLASSIC",
+                "expiry_seconds": 3,
+            },
+        )
+        signal_id = response.json()["id"]
+        details = client.get("/api/v1/signals").json()[0]
+        outcome = client.patch(
+            f"/api/v1/signals/{signal_id}/outcome",
+            json={"outcome": "WON"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["direction"] == "NO_SIGNAL"
+    assert response.json()["probability_up"] is None
+    assert response.json()["quote_timestamp_ms"] is None
+    assert details["quote_timestamp_ms"] is None
+    assert outcome.status_code == 409
+
+
+def test_otc_analysis_is_rejected_instead_of_using_fx_quotes(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.post(
+            "/api/v1/analyze",
+            json={
+                "symbol": "EUR/USD",
+                "market_type": "OTC",
+                "expiry_seconds": 30,
+            },
+        )
+
+    assert response.status_code == 409
+    assert "not OTC" in response.json()["detail"]
+
+
+def test_session_and_statistics_track_wins_losses_and_missed_signals(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO trading_sessions (id, started_at_ms) VALUES ('session-1', 1)"
+        )
+        for signal_id, outcome in (
+            ("signal-won", "WON"),
+            ("signal-lost", "LOST"),
+            ("signal-missed", "MISSED"),
+            ("signal-open", "PENDING"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO signals (
+                    id, session_id, provider, market_type, symbol, direction,
+                    expiry_seconds, issued_at_ms, expires_at_ms, market_snapshot_json,
+                    analytics_json, explanation, outcome
+                ) VALUES (?, 'session-1', 'TwelveData', 'CLASSIC', 'EUR/USD',
+                    'UP', 60, ?, ?, '{}', '{}', 'test', ?)
+                """,
+                (signal_id, int(time.time() * 1000), int(time.time() * 1000) + 60_000, outcome),
+            )
+
+    with TestClient(create_app(database_path)) as client:
+        summary = client.get(
+            "/api/v1/statistics",
+            params={"period": "all", "session_id": "session-1"},
+        ).json()
+        history = client.get(
+            "/api/v1/signals",
+            params={"session_id": "session-1", "limit": 10},
+        ).json()
+
+    assert summary["total_signals"] == 4
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["missed"] == 1
+    assert summary["pending"] == 1
+    assert summary["win_rate_percent"] == 50
+    assert summary["by_pair"]["EUR/USD"]["total"] == 4
+    assert len(history) == 4
+
+
+def test_technical_analysis_is_deterministic_and_requires_warmup() -> None:
+    short_history = [
+        Candle(timestamp_ms=index * 1000, open=1, high=1.1, low=0.9, close=1)
+        for index in range(20)
+    ]
+    trend = [
+        Candle(
+            timestamp_ms=index * 1000,
+            open=1 + index * 0.001,
+            high=1.001 + index * 0.001,
+            low=0.999 + index * 0.001,
+            close=1.001 + index * 0.001,
+        )
+        for index in range(80)
+    ]
+
+    no_warmup = analyze_candles(short_history)
+    first = analyze_candles(trend)
+    second = analyze_candles(trend)
+
+    assert no_warmup.candidate_direction == "NO_SIGNAL"
+    assert first.candidate_direction == "UP"
+    assert first.features == second.features
+    assert first.score == second.score
+
+
+def test_backtest_uses_temporal_holdout_and_rejects_seconds_on_minute_bars() -> None:
+    candles = [
+        Candle(
+            timestamp_ms=index * 60_000,
+            open=1 + index * 0.001,
+            high=1.001 + index * 0.001,
+            low=0.999 + index * 0.001,
+            close=1.001 + index * 0.001,
+        )
+        for index in range(120)
+    ]
+
+    result = run_backtest(
+        candles,
+        provider="Dukascopy",
+        symbol="EUR/USD",
+        candle_interval_seconds=60,
+        expiry_seconds=60,
+    )
+
+    assert result.sample_count == 23
+    assert result.trade_count == 23
+    assert result.wins == 23
+    assert result.accuracy_percent == 100
+    assert result.out_of_sample_start_ms == 96 * 60_000
+    with pytest.raises(BacktestError, match="second-based expirations"):
+        run_backtest(
+            candles,
+            provider="Dukascopy",
+            symbol="EUR/USD",
+            candle_interval_seconds=60,
+            expiry_seconds=3,
+        )
+
+
+def test_learning_requires_minimum_labels_and_uses_chronological_holdouts() -> None:
+    records = [
+        {
+            "issued_at_ms": index * 1000,
+            "direction": "UP",
+            "expiry_seconds": 60,
+            "outcome": "WON" if index % 2 == 0 else "LOST",
+            "analytics_json": json.dumps(
+                {
+                    "score": 2 if index % 2 == 0 else -2,
+                    "rsi_14": 65 if index % 2 == 0 else 35,
+                    "macd_histogram": 0.01 if index % 2 == 0 else -0.01,
+                    "momentum_5": 0.001 if index % 2 == 0 else -0.001,
+                    "volatility_20": 0.001,
+                    "buyer_seller_pressure_20": 0.5 if index % 2 == 0 else -0.5,
+                }
+            ),
+            "market_snapshot_json": json.dumps({"latest_price": 1}),
+        }
+        for index in range(MINIMUM_LABELED_SIGNALS)
+    ]
+
+    insufficient = train_model(records[: MINIMUM_LABELED_SIGNALS - 1])
+    trained = train_model(records)
+
+    assert insufficient.eligible is False
+    assert trained.validation_samples == 30
+    assert trained.eligible is True
+    assert trained.artifact is not None
+    assert trained.artifact["calibration"]
+    assert trained.metrics["brier_score"] < trained.metrics["baseline_brier_score"]
+    probability = predict_win_probability(
+        trained.artifact,
+        json.loads(records[-2]["analytics_json"]),
+        {"latest_price": 1},
+        "UP",
+        60,
+    )
+    assert probability > 0.5

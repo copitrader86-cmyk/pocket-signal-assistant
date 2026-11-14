@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.egg-info/
+
+backend/data/
+*.db-wal
+*.db-shm
+
+.gradle/
+**/build/
+local.properties
+*.apk

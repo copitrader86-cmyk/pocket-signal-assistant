@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pocket-signal-api
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_PATH
+        value: /tmp/pocket-signal/signals.db
+      - key: PYTHONUNBUFFERED
+        value: "1"
