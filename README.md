@@ -51,7 +51,12 @@ For automated Render deployments from GitHub, add two secret values in the
 repository settings: `RENDER_API_KEY` (Render API key) and
 `RENDER_SERVICE_ID` (the existing service ID, such as the current Render web
 service ID). The workflow in `.github/workflows/render-deploy.yml` reads these
-values and triggers a deploy without exposing the secrets in code or logs.
+values and triggers a deploy on every push to `main` or a manual dispatch,
+without exposing the secrets in code or logs. It waits for the Render deploy
+and then checks backend health, source credentials, the Twelve Data catalog and
+history endpoints, and the WebSocket handshake. These checks fail the workflow
+when production is unhealthy or `TWELVE_DATA_API_KEY` is missing from the
+existing Render service's Environment settings.
 
 Render Free has an ephemeral filesystem. SQLite data, including downloaded
 HistData candles and sync cursors, can be lost when the service restarts,
@@ -102,9 +107,9 @@ disabled by the server's data-source policy unless a real authorized OTC feed
 is implemented.
 
 The Android Actions workflow builds and uploads the `PocketSignal-debug-apk`
-artifact on manual `workflow_dispatch` runs. It also runs for `v*` tag pushes;
-those tagged runs additionally build and publish a signed release APK when
-release-signing secrets are configured.
+artifact on pushes to `main` and manual `workflow_dispatch` runs. It also runs
+for `v*` tag pushes; those tagged runs additionally build and publish a signed
+release APK when release-signing secrets are configured.
 
 ## Market data and API
 
