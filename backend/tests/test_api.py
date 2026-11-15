@@ -42,6 +42,41 @@ def test_catalog_does_not_claim_unconfigured_markets(tmp_path: Path) -> None:
     }
 
 
+def test_catalog_and_history_status_work_without_server_twelvedata_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
+    database_path = tmp_path / "signals.db"
+    initialize_database(database_path)
+    with connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO candles (
+                provider, market_type, symbol, interval_seconds, timestamp_ms,
+                open, high, low, close, data_kind, source_resolution_ms
+            ) VALUES ('HistData', 'CLASSIC', 'EUR/USD', 60, 1700000000000,
+                1.1, 1.2, 1.0, 1.15, 'HISTORICAL', 60000)
+            """
+        )
+
+    with TestClient(create_app(database_path)) as client:
+        catalog = client.get("/api/v1/catalog")
+        status = client.get("/api/v1/sources/status")
+
+    assert catalog.status_code == 200
+    assert catalog.json()["instruments"] == [
+        {
+            "provider": "HistData",
+            "market_type": "CLASSIC",
+            "symbol": "EUR/USD",
+            "display_name": "EUR/USD",
+        }
+    ]
+    assert status.status_code == 200
+    assert status.json()["historical"]["histdata_candles"] == 1
+    assert status.json()["online"]["credentials_configured"] is False
+
+
 def test_database_schema_rejects_unsupported_expiration(tmp_path: Path) -> None:
     database_path = tmp_path / "signals.db"
     initialize_database(database_path)
@@ -79,6 +114,8 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
         connection.execute("DROP TABLE market_ticks")
         connection.execute("DROP TABLE reference_rates")
         connection.execute("DROP TABLE public_history_sync")
+        connection.execute("DROP INDEX candles_historical_lookup")
+        connection.execute("DROP INDEX candles_history_coverage")
         connection.execute("ALTER TABLE candles DROP COLUMN source_resolution_ms")
         connection.execute("PRAGMA user_version = 2")
 
@@ -90,7 +127,7 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
             "SELECT id, quote_timestamp_ms FROM signals WHERE id = 'keep-me'"
         ).fetchone()
 
-    assert version == 10
+    assert version == 13
     assert tuple(signal) == ("keep-me", None)
 
 

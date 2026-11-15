@@ -57,10 +57,10 @@ repository settings: `RENDER_API_KEY` (Render API key) and
 service ID). The workflow in `.github/workflows/render-deploy.yml` reads these
 values and triggers a deploy on every push to `main` or a manual dispatch,
 without exposing the secrets in code or logs. It waits for the Render deploy
-and then checks backend health, source credentials, the Twelve Data catalog and
-history endpoints, and the WebSocket handshake. These checks fail the workflow
-when production is unhealthy or `TWELVE_DATA_API_KEY` is missing from the
-existing Render service's Environment settings.
+and then checks backend health, source-status and instrument-catalog responses,
+and the WebSocket handshake. These service checks do not require a server-wide
+`TWELVE_DATA_API_KEY`: Android users can provide their own device-encrypted key
+when they need Twelve Data, without putting it in the APK or GitHub Actions.
 
 Render Free has an ephemeral filesystem. SQLite data, including downloaded
 HistData candles and sync cursors, can be lost when the service restarts,
