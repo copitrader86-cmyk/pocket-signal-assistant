@@ -114,6 +114,8 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
         connection.execute("DROP TABLE market_ticks")
         connection.execute("DROP TABLE reference_rates")
         connection.execute("DROP TABLE public_history_sync")
+        connection.execute("DROP INDEX candles_historical_lookup")
+        connection.execute("DROP INDEX candles_history_coverage")
         connection.execute("ALTER TABLE candles DROP COLUMN source_resolution_ms")
         connection.execute("PRAGMA user_version = 2")
 
@@ -125,7 +127,7 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
             "SELECT id, quote_timestamp_ms FROM signals WHERE id = 'keep-me'"
         ).fetchone()
 
-    assert version == 11
+    assert version == 13
     assert tuple(signal) == ("keep-me", None)
 
 

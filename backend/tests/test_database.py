@@ -10,6 +10,7 @@ def test_schema_upgrade_adds_covering_historical_candle_index(
     initialize_database(database_path)
     with connect(database_path) as connection:
         connection.execute("DROP INDEX candles_historical_lookup")
+        connection.execute("DROP INDEX candles_history_coverage")
         connection.execute("PRAGMA user_version = 10")
 
     initialize_database(database_path)
@@ -46,9 +47,28 @@ def test_schema_upgrade_adds_covering_historical_candle_index(
             """,
             ("HistData", None, None),
         ).fetchall()
+        history_plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT symbol, provider, interval_seconds, source_resolution_ms,
+                MIN(timestamp_ms), MAX(timestamp_ms), COUNT(*)
+            FROM candles
+            WHERE provider IN (?, ?) AND data_kind = 'HISTORICAL'
+            GROUP BY symbol, provider, interval_seconds, source_resolution_ms
+            """,
+            ("Dukascopy", "HistData"),
+        ).fetchall()
 
-    assert version == 11
+    assert version == 13
     assert any(
-        "candles_historical_lookup" in row["detail"] for row in catalog_plan
+        "USING COVERING INDEX candles_historical_lookup" in row["detail"]
+        for row in catalog_plan
     )
-    assert any("candles_historical_lookup" in row["detail"] for row in status_plan)
+    assert any(
+        "USING COVERING INDEX candles_history_coverage" in row["detail"]
+        for row in status_plan
+    )
+    assert any(
+        "USING COVERING INDEX candles_history_coverage" in row["detail"]
+        for row in history_plan
+    )
