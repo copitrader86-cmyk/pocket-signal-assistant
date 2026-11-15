@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -35,10 +36,14 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -61,6 +66,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
@@ -146,6 +152,7 @@ private data class Stats(
     val total: Int,
     val wins: Int,
     val losses: Int,
+    val draws: Int,
     val missed: Int,
     val pending: Int,
     val winRate: Double?,
@@ -159,6 +166,7 @@ private data class GroupStats(
     val total: Int,
     val wins: Int,
     val losses: Int,
+    val draws: Int,
     val missed: Int,
 )
 
@@ -216,6 +224,20 @@ private object Api {
         .build()
 
     private val base = BuildConfig.API_BASE_URL.trimEnd('/')
+    @Volatile
+    private var providerApiKey: String? = null
+
+    fun setProviderApiKey(apiKey: String?) {
+        providerApiKey = apiKey?.trim()?.takeIf(String::isNotEmpty)
+    }
+
+    private fun Request.Builder.addProviderApiKey(): Request.Builder {
+        val apiKey = providerApiKey ?: return this
+        check(base.startsWith("https://", ignoreCase = true)) {
+            "API key can only be sent to a secure HTTPS server"
+        }
+        return header("X-Twelve-Data-Api-Key", apiKey)
+    }
 
     private suspend fun request(
         path: String,
@@ -229,6 +251,7 @@ private object Api {
                 if (method == "GET") null
                 else (body ?: "{}").toRequestBodyJson(),
             )
+            .addProviderApiKey()
             .build()
         http.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
@@ -390,6 +413,10 @@ private object Api {
     suspend fun health(): Long =
         request("/health").getLong("server_time_ms")
 
+    suspend fun checkTwelveDataConnection(): Int =
+        request("/api/v1/provider/twelvedata/check", "POST")
+            .getInt("instruments_updated")
+
     suspend fun startSession(): String =
         request("/api/v1/sessions", "POST").getString("id")
 
@@ -446,7 +473,10 @@ private object Api {
     }
 
     suspend fun allHistory(): List<TradeRecord> = withContext(Dispatchers.IO) {
-        val request = Request.Builder().url("$base/api/v1/signals").build()
+        val request = Request.Builder()
+            .url("$base/api/v1/signals")
+            .addProviderApiKey()
+            .build()
         http.newCall(request).execute().use { response ->
             val text = response.body?.string().orEmpty()
             if (!response.isSuccessful) error("Could not load signal history")
@@ -463,6 +493,7 @@ private object Api {
             total = json.getInt("total_signals"),
             wins = json.getInt("wins"),
             losses = json.getInt("losses"),
+            draws = json.getInt("draws"),
             missed = json.getInt("missed"),
             pending = json.getInt("pending"),
             winRate = json.nullableDouble("win_rate_percent"),
@@ -494,7 +525,10 @@ private object Api {
         onTick: (Double, Long) -> Unit,
         onError: (String) -> Unit,
     ): WebSocket {
-        val request = Request.Builder().url(streamUrl(symbol)).build()
+        val request = Request.Builder()
+            .url(streamUrl(symbol))
+            .addProviderApiKey()
+            .build()
         return http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 onConnected()
@@ -535,6 +569,7 @@ private fun JSONObject.toGroupStats(): Map<String, GroupStats> =
             total = item.getInt("total"),
             wins = item.getInt("won"),
             losses = item.getInt("lost"),
+            draws = item.getInt("draw"),
             missed = item.getInt("missed"),
         )
     }
@@ -570,7 +605,7 @@ private fun JSONArray.toRecords(): List<TradeRecord> =
         )
     }
 
-private enum class Page { HOME, MARKET_CHART, ANALYSIS, HISTORY, STATISTICS, TESTING }
+private enum class Page { HOME, MARKET_CHART, ANALYSIS, HISTORY, STATISTICS, SETTINGS, TESTING }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -582,11 +617,19 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun PocketSignalApp() {
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current.applicationContext
+    val keyStore = remember { SecureApiKeyStore(context) }
     var page by remember { mutableStateOf(Page.HOME) }
     var instruments by remember { mutableStateOf<List<Instrument>>(emptyList()) }
     var selected by remember { mutableStateOf<Instrument?>(null) }
     var market by remember { mutableStateOf("CLASSIC") }
     var expiry by remember { mutableIntStateOf(60) }
+    var chartInterval by remember { mutableIntStateOf(60) }
+    var credentialVersion by remember { mutableIntStateOf(0) }
+    var credentialsLoaded by remember { mutableStateOf(false) }
+    var hasSavedApiKey by remember { mutableStateOf(false) }
+    var keyStatus by remember { mutableStateOf<String?>(null) }
+    var keyCheckSucceeded by remember { mutableStateOf<Boolean?>(null) }
     var sessionId by remember { mutableStateOf<String?>(null) }
     var signal by remember { mutableStateOf<Signal?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -598,7 +641,21 @@ private fun PocketSignalApp() {
     var onlineSourceStatus by remember { mutableStateOf<OnlineSourceStatus?>(null) }
     var serverClockOffsetMs by remember { mutableLongStateOf(0L) }
 
-    LaunchedEffect(selected?.symbol) {
+    LaunchedEffect(Unit) {
+        try {
+            val savedKey = withContext(Dispatchers.IO) { keyStore.load() }
+            Api.setProviderApiKey(savedKey)
+            hasSavedApiKey = savedKey != null
+        } catch (failure: Exception) {
+            keyStatus = failure.message ?: "Не удалось прочитать сохранённый ключ"
+            keyCheckSucceeded = false
+        } finally {
+            credentialsLoaded = true
+        }
+    }
+
+    LaunchedEffect(credentialsLoaded, selected?.symbol, credentialVersion) {
+        if (!credentialsLoaded) return@LaunchedEffect
         var retryDelayMs = 1_000L
         while (true) {
             serverStatus = "CONNECTING"
@@ -614,9 +671,6 @@ private fun PocketSignalApp() {
                 onlineSourceStatus = Api.sourceStatus(selected?.symbol)
                 serverStatus = "CONNECTED"
                 retryDelayMs = 1_000L
-                if (catalog.none { it.marketType == "OTC" }) {
-                    error = "OTC feed is not configured. Classic Forex prices are not OTC."
-                }
                 delay(5_000)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -629,32 +683,93 @@ private fun PocketSignalApp() {
         }
     }
 
-    DisposableEffect(page, selected?.symbol, serverStatus) {
-        val instrument = selected
-        if (page != Page.HOME || serverStatus != "CONNECTED" || instrument == null) {
-            onDispose { }
-        } else {
-            val mainThread = Handler(Looper.getMainLooper())
-            val socket = Api.openStream(
-                instrument.symbol,
-                onConnected = { },
-                onTick = { _, _ -> },
-                onError = { message ->
-                    mainThread.post {
-                        onlineSourceStatus = onlineSourceStatus?.copy(
-                            ready = false,
-                            status = "stale_or_unavailable",
-                            reason = message,
-                        )
-                    }
-                },
-            )
-            onDispose { socket.close(1000, "Leaving ONLINE home") }
-        }
+    BackHandler(enabled = page != Page.HOME) {
+        page = Page.HOME
     }
 
-    BackHandler(enabled = page != Page.HOME) {
-        page = if (page == Page.ANALYSIS) Page.HOME else Page.HOME
+    val openHistory = {
+        busy = true
+        runAsync(
+            scope,
+            success = { history = it; busy = false; page = Page.HISTORY },
+            failure = { error = it; busy = false },
+        ) { Api.allHistory() }
+    }
+    val openStatistics: (String) -> Unit = { period ->
+        statsPeriod = period
+        busy = true
+        runAsync(
+            scope,
+            success = { stats = it; busy = false; page = Page.STATISTICS },
+            failure = { error = it; busy = false },
+        ) { Api.statistics(period, sessionId) }
+    }
+    val saveApiKey: (String) -> Unit = { value ->
+        busy = true
+        keyStatus = null
+        keyCheckSucceeded = null
+        runAsync(
+            scope,
+            success = {
+                hasSavedApiKey = true
+                credentialVersion += 1
+                keyStatus = "Ключ безопасно сохранён на устройстве"
+                busy = false
+            },
+            failure = {
+                keyStatus = it
+                keyCheckSucceeded = false
+                busy = false
+            },
+        ) {
+            withContext(Dispatchers.IO) { keyStore.save(value) }
+            Api.setProviderApiKey(value)
+            true
+        }
+    }
+    val checkApiKey = {
+        busy = true
+        keyStatus = "Проверка соединения с Twelve Data…"
+        keyCheckSucceeded = null
+        runAsync(
+            scope,
+            success = { (count, catalog) ->
+                keyStatus = "ПОДКЛЮЧЕНО • доступно пар: $count"
+                keyCheckSucceeded = true
+                busy = false
+                instruments = catalog.filter { it.marketType == "CLASSIC" }
+            },
+            failure = {
+                keyStatus = "ОШИБКА: $it"
+                keyCheckSucceeded = false
+                busy = false
+            },
+        ) {
+            Api.checkTwelveDataConnection() to Api.catalog()
+        }
+    }
+    val deleteApiKey = {
+        busy = true
+        keyStatus = null
+        keyCheckSucceeded = null
+        runAsync(
+            scope,
+            success = {
+                Api.setProviderApiKey(null)
+                hasSavedApiKey = false
+                credentialVersion += 1
+                keyStatus = "Сохранённый ключ удалён"
+                busy = false
+            },
+            failure = {
+                keyStatus = it
+                keyCheckSucceeded = false
+                busy = false
+            },
+        ) {
+            withContext(Dispatchers.IO) { keyStore.delete() }
+            true
+        }
     }
 
     MaterialTheme(
@@ -668,117 +783,145 @@ private fun PocketSignalApp() {
         ),
     ) {
         Surface(Modifier.fillMaxSize().safeDrawingPadding(), color = Ink) {
-            when (page) {
-                Page.HOME -> HomeScreen(
-                    instruments = instruments,
-                    selected = selected,
-                    onSelect = { selected = it },
-                    market = market,
-                    onMarket = { market = it },
-                    expiry = expiry,
-                    onExpiry = { expiry = it },
-                    sessionId = sessionId,
-                    serverStatus = serverStatus,
-                    onlineSourceStatus = onlineSourceStatus,
-                    error = error,
-                    busy = busy,
-                    onSession = {
-                        busy = true
-                        error = null
-                        runAsync(scope,
-                            success = { id -> sessionId = id; busy = false },
-                            failure = { error = it; busy = false },
-                        ) {
-                            val current = sessionId
-                            if (current == null) Api.startSession()
-                            else {
-                                Api.finishSession(current)
-                                null
-                            }
-                        }
-                    },
-                    onSignal = {
-                        if (market == "OTC") {
-                            error = "OTC is unavailable until an authorized Pocket Option OTC feed is configured."
-                            return@HomeScreen
-                        }
-                        val instrument = selected ?: return@HomeScreen
-                        busy = true
-                        error = null
-                        runAsync(scope,
-                            success = {
-                                signal = it
-                                busy = false
-                                page = Page.ANALYSIS
+            Column {
+                Box(Modifier.weight(1f)) {
+                    when (page) {
+                        Page.HOME -> HomeScreen(
+                            instruments = instruments,
+                            selected = selected,
+                            onSelect = { selected = it },
+                            market = market,
+                            onMarket = { market = it },
+                            expiry = expiry,
+                            onExpiry = { expiry = it },
+                            chartInterval = chartInterval,
+                            onChartInterval = { chartInterval = it },
+                            credentialVersion = credentialVersion,
+                            sessionId = sessionId,
+                            serverStatus = serverStatus,
+                            onlineSourceStatus = onlineSourceStatus,
+                            signal = signal,
+                            error = error,
+                            busy = busy,
+                            onSession = {
+                                busy = true
+                                error = null
+                                runAsync(
+                                    scope,
+                                    success = { id -> sessionId = id; busy = false },
+                                    failure = { error = it; busy = false },
+                                ) {
+                                    val current = sessionId
+                                    if (current == null) Api.startSession()
+                                    else {
+                                        Api.finishSession(current)
+                                        null
+                                    }
+                                }
                             },
-                            failure = { error = it; busy = false },
-                        ) { Api.analyze(instrument.symbol, expiry, sessionId) }
-                    },
-                    onHistory = {
-                        busy = true
-                        runAsync(scope,
-                            success = { history = it; busy = false; page = Page.HISTORY },
-                            failure = { error = it; busy = false },
-                        ) { Api.allHistory() }
-                    },
-                    onMarketChart = { page = Page.MARKET_CHART },
-                    onStatistics = {
-                        busy = true
-                        runAsync(scope,
-                            success = { stats = it; busy = false; page = Page.STATISTICS },
-                            failure = { error = it; busy = false },
-                        ) { Api.statistics(statsPeriod, sessionId) }
-                    },
-                    onTesting = { page = Page.TESTING },
-                )
-                Page.MARKET_CHART -> MarketChartScreen(
-                    instruments = instruments,
-                    selected = selected,
-                    onSelect = { selected = it },
-                    onBack = { page = Page.HOME },
-                )
-                Page.ANALYSIS -> AnalysisScreen(
-                    signal = signal,
-                    serverClockOffsetMs = serverClockOffsetMs,
-                    onBack = { page = Page.HOME },
-                    onReanalyze = {
-                        val instrument = selected ?: return@AnalysisScreen
-                        busy = true
-                        runAsync(
-                            scope,
-                            success = { signal = it; busy = false },
-                            failure = { error = it; busy = false },
-                        ) { Api.analyze(instrument.symbol, expiry, sessionId) }
-                    },
-                    onOutcome = { outcome ->
-                        val current = signal ?: return@AnalysisScreen
-                        busy = true
-                        runAsync(scope,
-                            success = {
-                                busy = false
-                                page = Page.HOME
-                                signal = null
+                            onSignal = {
+                                if (market == "OTC") {
+                                    error = "OTC недоступен без авторизованного источника Pocket Option."
+                                    return@HomeScreen
+                                }
+                                val instrument = selected ?: return@HomeScreen
+                                busy = true
+                                error = null
+                                runAsync(
+                                    scope,
+                                    success = { signal = it; busy = false },
+                                    failure = { error = it; busy = false },
+                                ) { Api.analyze(instrument.symbol, expiry, sessionId) }
                             },
-                            failure = { error = it; busy = false },
-                        ) { Api.recordOutcome(current.id, outcome) }
-                    },
-                    busy = busy,
-                )
-                Page.HISTORY -> HistoryScreen(history, onBack = { page = Page.HOME })
-                Page.STATISTICS -> StatisticsScreen(
-                    stats = stats,
-                    period = statsPeriod,
-                    onPeriod = { period ->
-                        statsPeriod = period
-                        busy = true
-                        runAsync(scope,
-                            success = { stats = it; busy = false },
-                            failure = { error = it; busy = false },
-                        ) { Api.statistics(period, sessionId) }
-                    },
-                    onBack = { page = Page.HOME },
-                )
-                Page.TESTING -> TestingScreen(onBack = { page = Page.HOME })
+                            onOpenSignal = { if (signal != null) page = Page.ANALYSIS },
+                            onSettings = { page = Page.SETTINGS },
+                            onMarketChart = { page = Page.MARKET_CHART },
+                        )
+                        Page.MARKET_CHART -> MarketChartScreen(
+                            instruments = instruments,
+                            selected = selected,
+                            onSelect = { selected = it },
+                            onBack = { page = Page.HOME },
+                        )
+                        Page.ANALYSIS -> AnalysisScreen(
+                            signal = signal,
+                            serverClockOffsetMs = serverClockOffsetMs,
+                            onBack = { page = Page.HOME },
+                            onReanalyze = {
+                                val instrument = selected ?: return@AnalysisScreen
+                                busy = true
+                                runAsync(
+                                    scope,
+                                    success = { signal = it; busy = false },
+                                    failure = { error = it; busy = false },
+                                ) { Api.analyze(instrument.symbol, expiry, sessionId) }
+                            },
+                            onOutcome = { outcome ->
+                                val current = signal ?: return@AnalysisScreen
+                                busy = true
+                                runAsync(
+                                    scope,
+                                    success = { busy = false; page = Page.HOME; signal = null },
+                                    failure = { error = it; busy = false },
+                                ) { Api.recordOutcome(current.id, outcome) }
+                            },
+                            busy = busy,
+                        )
+                        Page.HISTORY -> HistoryScreen(history, onBack = { page = Page.HOME })
+                        Page.STATISTICS -> StatisticsScreen(
+                            stats = stats,
+                            period = statsPeriod,
+                            onPeriod = { period ->
+                                statsPeriod = period
+                                busy = true
+                                runAsync(
+                                    scope,
+                                    success = { stats = it; busy = false },
+                                    failure = { error = it; busy = false },
+                                ) { Api.statistics(period, sessionId) }
+                            },
+                            onBack = { page = Page.HOME },
+                        )
+                        Page.SETTINGS -> SettingsScreen(
+                            hasSavedApiKey = hasSavedApiKey,
+                            keyStatus = keyStatus,
+                            keyCheckSucceeded = keyCheckSucceeded,
+                            busy = busy,
+                            onSaveKey = saveApiKey,
+                            onCheckConnection = checkApiKey,
+                            onDeleteKey = deleteApiKey,
+                            onTesting = { page = Page.TESTING },
+                        )
+                        Page.TESTING -> TestingScreen(onBack = { page = Page.SETTINGS })
+                    }
+                }
+                NavigationBar(containerColor = Panel) {
+                    val selectedTab = page.takeIf {
+                        it == Page.HOME || it == Page.HISTORY ||
+                            it == Page.STATISTICS || it == Page.SETTINGS
+                    } ?: Page.HOME
+                    listOf(
+                        Triple(Page.HOME, "⌂", "ГЛАВНАЯ"),
+                        Triple(Page.HISTORY, "◷", "ИСТОРИЯ"),
+                        Triple(Page.STATISTICS, "▤", "СТАТИСТИКА"),
+                        Triple(Page.SETTINGS, "⚙", "НАСТРОЙКИ"),
+                    ).forEach { (tab, icon, label) ->
+                        NavigationBarItem(
+                            selected = selectedTab == tab,
+                            onClick = {
+                                when (tab) {
+                                    Page.HOME -> page = Page.HOME
+                                    Page.HISTORY -> openHistory()
+                                    Page.STATISTICS -> openStatistics(statsPeriod)
+                                    Page.SETTINGS -> page = Page.SETTINGS
+                                    else -> Unit
+                                }
+                            },
+                            icon = { Text(icon) },
+                            label = { Text(label, fontSize = 9.sp, maxLines = 1) },
+                        )
+                    }
+                }
             }
         }
     }
@@ -806,155 +949,127 @@ private fun HomeScreen(
     onMarket: (String) -> Unit,
     expiry: Int,
     onExpiry: (Int) -> Unit,
+    chartInterval: Int,
+    onChartInterval: (Int) -> Unit,
+    credentialVersion: Int,
     sessionId: String?,
     serverStatus: String,
     onlineSourceStatus: OnlineSourceStatus?,
+    signal: Signal?,
     error: String?,
     busy: Boolean,
     onSession: () -> Unit,
     onSignal: () -> Unit,
-    onHistory: () -> Unit,
+    onOpenSignal: () -> Unit,
+    onSettings: () -> Unit,
     onMarketChart: () -> Unit,
-    onStatistics: () -> Unit,
-    onTesting: () -> Unit,
 ) {
     Column(
-        Modifier.fillMaxSize().background(Ink).padding(horizontal = 22.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(17.dp),
+        Modifier.fillMaxSize()
+            .background(Ink)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("POCKET SIGNAL", color = Color.White, fontWeight = FontWeight.Black, fontSize = 21.sp)
-                Text("РЕЖИМ ONLINE • ТЕКУЩИЕ КОТИРОВКИ", color = Muted, fontSize = 10.sp, letterSpacing = 1.1.sp)
-            }
-            Row(
-                Modifier.background(Color(0xFF162438), CircleShape).padding(horizontal = 11.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val statusColor = when (serverStatus) {
-                    "CONNECTED" -> Mint
-                    "CONNECTING" -> Gold
-                    else -> Rose
-                }
-                Box(Modifier.size(7.dp).background(statusColor, CircleShape))
-                Spacer(Modifier.width(7.dp))
                 Text(
-                    when (serverStatus) {
-                        "CONNECTED" -> "СЕРВЕР"
-                        "CONNECTING" -> "СВЯЗЬ…"
-                        else -> "НЕТ СВЯЗИ"
-                    },
+                    "POCKET SIGNAL ASSISTANT",
+                    color = Color.White,
+                    fontWeight = FontWeight.Black,
+                    fontSize = 15.sp,
+                    maxLines = 1,
+                )
+                Text(
+                    "КОТИРОВКИ: ${selected?.provider ?: "TWELVE DATA"}",
+                    color = Muted,
                     fontSize = 10.sp,
-                    color = statusColor,
+                    letterSpacing = 0.5.sp,
+                    maxLines = 1,
                 )
             }
+            OutlinedButton(
+                onClick = onSettings,
+                modifier = Modifier.size(44.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                shape = CircleShape,
+            ) { Text("⚙", fontSize = 20.sp) }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val statusColor = when {
+                serverStatus != "CONNECTED" -> Rose
+                onlineSourceStatus?.ready == true -> Mint
+                else -> Gold
+            }
+            Box(Modifier.size(8.dp).background(statusColor, CircleShape))
+            Spacer(Modifier.width(7.dp))
+            Text(
+                when {
+                    serverStatus == "CONNECTING" -> "ПОДКЛЮЧЕНИЕ К СЕРВЕРУ"
+                    serverStatus != "CONNECTED" -> "СЕРВЕР НЕДОСТУПЕН"
+                    onlineSourceStatus?.ready == true -> "ИСТОЧНИК ПОДКЛЮЧЁН"
+                    else -> "КОТИРОВКИ ОЖИДАЮТСЯ"
+                },
+                color = statusColor,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(selected?.provider ?: "Twelve Data", color = Muted, fontSize = 10.sp)
         }
 
         Card(
             colors = CardDefaults.cardColors(containerColor = Panel),
-            shape = RoundedCornerShape(22.dp),
+            shape = RoundedCornerShape(18.dp),
         ) {
-            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Text("TRADE SETUP", color = Muted, fontSize = 11.sp, letterSpacing = 1.5.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("ПАРАМЕТРЫ СДЕЛКИ", color = Muted, fontSize = 10.sp, letterSpacing = 1.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     SelectionMenu(
-                        label = "INSTRUMENT",
-                        value = selected?.displayName ?: "No data source",
-                        items = instruments.map { it.displayName },
-                        onSelected = { name -> instruments.firstOrNull { it.displayName == name }?.let(onSelect) },
-                        modifier = Modifier.weight(1.3f),
+                        label = "ВАЛЮТНАЯ ПАРА",
+                        value = selected?.symbol ?: "Нет данных",
+                        items = instruments.map { it.symbol },
+                        onSelected = { name -> instruments.firstOrNull { it.symbol == name }?.let(onSelect) },
+                        modifier = Modifier.weight(1f),
                         enabled = instruments.isNotEmpty(),
                     )
                     SelectionMenu(
-                        label = "MARKET",
-                        value = market,
-                        items = listOf("CLASSIC", "OTC"),
-                        onSelected = onMarket,
-                        modifier = Modifier.weight(0.8f),
+                        label = "РЫНОК",
+                        value = if (market == "CLASSIC") "Классический" else "OTC",
+                        items = listOf("Классический", "OTC"),
+                        onSelected = { onMarket(if (it == "Классический") "CLASSIC" else "OTC") },
+                        modifier = Modifier.weight(1f),
                         enabled = true,
                     )
                 }
-                SelectionMenu(
-                    label = "EXPIRATION",
-                    value = formatExpiry(expiry),
-                    items = Expirations.map(::formatExpiry),
-                    onSelected = { value -> Expirations.firstOrNull { formatExpiry(it) == value }?.let(onExpiry) },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = true,
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("MARKET SOURCE", color = Muted, fontSize = 10.sp, modifier = Modifier.weight(1f))
-                    Text(selected?.provider ?: "NOT CONFIGURED", color = if (selected == null) Gold else Mint, fontSize = 11.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SelectionMenu(
+                        label = "ЭКСПИРАЦИЯ",
+                        value = formatExpiry(expiry),
+                        items = Expirations.map(::formatExpiry),
+                        onSelected = { value -> Expirations.firstOrNull { formatExpiry(it) == value }?.let(onExpiry) },
+                        modifier = Modifier.weight(1f),
+                        enabled = true,
+                    )
+                    SelectionMenu(
+                        label = "ТАЙМФРЕЙМ",
+                        value = formatChartInterval(chartInterval),
+                        items = ChartIntervals.map(::formatChartInterval),
+                        onSelected = { value ->
+                            ChartIntervals.firstOrNull { formatChartInterval(it) == value }
+                                ?.let(onChartInterval)
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = true,
+                    )
                 }
-            }
-        }
-
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF101A29)), shape = RoundedCornerShape(18.dp)) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    if (onlineSourceStatus?.ready == true) "ONLINE • КОТИРОВКИ ДОСТУПНЫ"
-                    else "ONLINE • КОТИРОВКИ НЕДОСТУПНЫ",
-                    color = if (onlineSourceStatus?.ready == true) Mint else Gold,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp,
-                )
-                Text(
-                    onlineSourceStatus?.reason
-                        ?: if (instruments.isEmpty()) "Каталог пар не загружен."
-                        else "Поставщик: ${selected?.provider}. Это не котировки Pocket Option OTC.",
-                    color = Muted,
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp,
-                )
-                Text(
-                    "Частота: ${onlineSourceStatus?.updateFrequency ?: "проверка источника…"}",
-                    color = Muted,
-                    fontSize = 10.sp,
-                    lineHeight = 15.sp,
-                )
-                Text(
-                    "Последняя котировка: ${onlineSourceStatus?.lastQuoteTimestamp?.let(::formatDateTime) ?: "нет"}",
-                    color = Muted,
-                    fontSize = 10.sp,
-                )
-                Text(
-                    "Последняя дневная справочная дата: ${onlineSourceStatus?.referenceLastDate ?: "нет данных"} " +
-                        "(${onlineSourceStatus?.referenceObservations ?: 0} наблюдений, не подходит для кратких экспираций)",
-                    color = Muted,
-                    fontSize = 10.sp,
-                    lineHeight = 15.sp,
-                )
-                Text(
-                    when {
-                        onlineSourceStatus?.historySyncLoading == true ->
-                            "Историческая база: идёт синхронизация"
-                        onlineSourceStatus?.historySyncLastError != null ->
-                            "Последняя ошибка загрузки: ${onlineSourceStatus?.historySyncLastError}"
-                        onlineSourceStatus?.historySyncLastSuccess != null ->
-                            "Последняя успешная синхронизация: ${formatTime(onlineSourceStatus!!.historySyncLastSuccess!!)}"
-                        else -> "Историческая база: ожидание первой синхронизации сервера"
-                    },
-                    color = Muted,
-                    fontSize = 10.sp,
-                    lineHeight = 15.sp,
-                )
-                Text(
-                    "Архив тиков Dukascopy: ${onlineSourceStatus?.dukascopyStatus ?: "проверка…"}",
-                    color = if (onlineSourceStatus?.dukascopyStatus == "ready") Mint else Gold,
-                    fontSize = 10.sp,
-                )
-                Text(
-                    "Архив HistData M1: ${onlineSourceStatus?.histdataStatus ?: "проверка…"}",
-                    color = if (onlineSourceStatus?.histdataStatus == "доступен") Mint else Gold,
-                    fontSize = 10.sp,
-                )
             }
         }
 
         Button(
             onClick = onSignal,
-            enabled = selected != null && serverStatus == "CONNECTED" &&
-                onlineSourceStatus?.ready == true && !busy,
+            enabled = selected != null && serverStatus == "CONNECTED" && !busy,
             modifier = Modifier.fillMaxWidth().height(62.dp),
             shape = RoundedCornerShape(17.dp),
             colors = ButtonDefaults.buttonColors(
@@ -964,31 +1079,83 @@ private fun HomeScreen(
             ),
         ) {
             if (busy) CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
-            else Text("АНАЛИЗ ТЕКУЩЕГО РЫНКА", fontWeight = FontWeight.Black, letterSpacing = 1.sp)
+            else Text("ПОЛУЧИТЬ СИГНАЛ", fontWeight = FontWeight.Black, letterSpacing = 1.sp)
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onHistory, enabled = !busy, modifier = Modifier.weight(1f)) {
-                Text("HISTORY")
-            }
-            OutlinedButton(onClick = onStatistics, enabled = !busy, modifier = Modifier.weight(1f)) {
-                Text("STATISTICS")
-            }
-        }
-        OutlinedButton(
-            onClick = onMarketChart,
-            enabled = selected != null,
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = Mint),
+
+        Card(
+            Modifier.fillMaxWidth().height(245.dp),
+            colors = CardDefaults.cardColors(containerColor = Panel),
+            shape = RoundedCornerShape(18.dp),
         ) {
-            Text("ГРАФИК РЫНКА • СВЕЧИ")
+            HomeMarketChart(
+                symbol = selected?.symbol,
+                intervalSeconds = chartInterval,
+                onInterval = onChartInterval,
+                credentialVersion = credentialVersion,
+                serverReady = serverStatus == "CONNECTED",
+            )
         }
-        OutlinedButton(
-            onClick = onTesting,
-            enabled = !busy,
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = Gold),
+
+        Card(
+            Modifier.fillMaxWidth().clickable(onClick = onOpenSignal),
+            colors = CardDefaults.cardColors(containerColor = Panel),
+            shape = RoundedCornerShape(18.dp),
         ) {
-            Text("РЕЖИМ ТЕСТИРОВАНИЯ • ИСТОРИЯ")
+            Column(
+                Modifier.fillMaxWidth().padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text("ПОСЛЕДНИЙ СИГНАЛ", color = Muted, fontSize = 10.sp, letterSpacing = 1.sp)
+                val direction = signal?.direction
+                val signalColor = when (direction) {
+                    "UP" -> Mint
+                    "DOWN" -> Rose
+                    else -> Gold
+                }
+                Text(
+                    when (direction) {
+                        "UP" -> "↑  ВВЕРХ"
+                        "DOWN" -> "↓  ВНИЗ"
+                        "NO_SIGNAL" -> "—  НЕТ СИГНАЛА"
+                        else -> "ОЖИДАНИЕ АНАЛИЗА"
+                    },
+                    color = signalColor,
+                    fontWeight = FontWeight.Black,
+                    fontSize = 19.sp,
+                )
+                Text(
+                    "Уверенность: ${
+                        when (direction) {
+                            "UP" -> signal?.probabilityUp
+                            "DOWN" -> signal?.probabilityDown
+                            else -> null
+                        }?.let { "%.1f%%".format(Locale.US, it) } ?: "—"
+                    }",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                )
+                Text(
+                    "${signal?.symbol ?: selected?.symbol ?: "—"}  •  экспирация ${
+                        signal?.expirySeconds?.let(::formatExpiry) ?: formatExpiry(expiry)
+                    }  •  ${
+                        signal?.issuedAt?.let(::formatTime) ?: "не сформирован"
+                    }",
+                    color = Muted,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+
+        Text(
+            onlineSourceStatus?.reason
+                ?: "Последняя котировка: ${
+                    onlineSourceStatus?.lastQuoteTimestamp?.let(::formatDateTime) ?: "ожидание"
+                }",
+            color = if (onlineSourceStatus?.ready == true) Muted else Gold,
+            fontSize = 10.sp,
+        )
+        OutlinedButton(onClick = onMarketChart, enabled = selected != null, modifier = Modifier.fillMaxWidth()) {
+            Text("ОТКРЫТЬ ПОЛНЫЙ ГРАФИК")
         }
         OutlinedButton(
             onClick = onSession,
@@ -996,11 +1163,291 @@ private fun HomeScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = if (sessionId == null) Gold else Rose),
         ) {
-            Text(if (sessionId == null) "START TRADING SESSION" else "END CURRENT SESSION")
+            Text(if (sessionId == null) "НАЧАТЬ СЕССИЮ" else "ЗАВЕРШИТЬ СЕССИЮ")
         }
         if (error != null) Text(error, color = Rose, fontSize = 12.sp)
-        Spacer(Modifier.weight(1f))
-        Text("RECOMMENDATIONS ONLY  •  YOU PLACE EVERY TRADE", color = Muted, fontSize = 9.sp, letterSpacing = 1.sp)
+        Text("РЕКОМЕНДАЦИИ НЕ ЯВЛЯЮТСЯ АВТОМАТИЧЕСКОЙ СДЕЛКОЙ", color = Muted, fontSize = 9.sp)
+    }
+}
+
+@Composable
+private fun HomeMarketChart(
+    symbol: String?,
+    intervalSeconds: Int,
+    onInterval: (Int) -> Unit,
+    credentialVersion: Int,
+    serverReady: Boolean,
+) {
+    val mainThread = remember { Handler(Looper.getMainLooper()) }
+    var candles by remember { mutableStateOf<List<Candle>>(emptyList()) }
+    var latestPrice by remember { mutableStateOf<Double?>(null) }
+    var latestTick by remember { mutableStateOf<Pair<Long, Double>?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    var chartError by remember { mutableStateOf<String?>(null) }
+    var streamError by remember { mutableStateOf<String?>(null) }
+    var reconnectAttempt by remember { mutableIntStateOf(0) }
+    var reconnectTrigger by remember { mutableIntStateOf(0) }
+    val activeCandles by rememberUpdatedState(candles)
+    val activeInterval by rememberUpdatedState(intervalSeconds)
+    val activeLoading by rememberUpdatedState(loading)
+    val activeTick by rememberUpdatedState(latestTick)
+
+    LaunchedEffect(symbol, intervalSeconds, credentialVersion) {
+        if (symbol == null) {
+            candles = emptyList()
+            return@LaunchedEffect
+        }
+        loading = true
+        chartError = null
+        try {
+            val history = Api.historicalCandles(symbol, intervalSeconds)
+            candles = activeTick?.let { (timestamp, price) ->
+                history.withLiveTick(timestamp, price, intervalSeconds)
+            } ?: history
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            chartError = failure.message ?: "Не удалось загрузить свечи"
+        } finally {
+            loading = false
+        }
+    }
+
+    DisposableEffect(symbol, credentialVersion, serverReady, reconnectTrigger) {
+        if (symbol == null || !serverReady) {
+            onDispose { }
+        } else {
+            var disposed = false
+            var retry: Runnable? = null
+            var stableConnection: Runnable? = null
+            val socket = Api.openStream(
+                symbol,
+                onConnected = {
+                    mainThread.post {
+                        streamError = null
+                        retry?.let(mainThread::removeCallbacks)
+                        retry = null
+                        stableConnection?.let(mainThread::removeCallbacks)
+                        val resetAttempts = Runnable { reconnectAttempt = 0 }
+                        stableConnection = resetAttempts
+                        mainThread.postDelayed(resetAttempts, 10_000L)
+                    }
+                },
+                onTick = { price, timestamp ->
+                    mainThread.post {
+                        latestPrice = price
+                        latestTick = timestamp to price
+                        if (!activeLoading) {
+                            candles = activeCandles.withLiveTick(
+                                timestamp,
+                                price,
+                                activeInterval,
+                            )
+                        }
+                    }
+                },
+                onError = { message ->
+                    mainThread.post {
+                        if (disposed) return@post
+                        streamError = message
+                        stableConnection?.let(mainThread::removeCallbacks)
+                        if (retry == null) {
+                            val retryDelay = (1_000L * (1L shl reconnectAttempt.coerceIn(0, 5)))
+                                .coerceAtMost(30_000L)
+                            val next = Runnable {
+                                retry = null
+                                reconnectAttempt += 1
+                                reconnectTrigger += 1
+                            }
+                            retry = next
+                            mainThread.postDelayed(next, retryDelay)
+                        }
+                    }
+                },
+            )
+            onDispose {
+                disposed = true
+                retry?.let(mainThread::removeCallbacks)
+                stableConnection?.let(mainThread::removeCallbacks)
+                socket.close(1000, "Leaving home chart")
+            }
+        }
+    }
+
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("СВЕЧНОЙ ГРАФИК", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            Spacer(Modifier.weight(1f))
+            Text(
+                latestPrice?.let { "%.5f".format(Locale.US, it) } ?: "—",
+                color = Mint,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+            )
+        }
+        Text(
+            "${symbol ?: "Нет пары"}  •  ${formatChartInterval(intervalSeconds)}  •  Twelve Data",
+            color = Muted,
+            fontSize = 9.sp,
+        )
+        Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+            when {
+                loading && candles.isEmpty() -> CircularProgressIndicator(
+                    Modifier.size(22.dp),
+                    color = Mint,
+                    strokeWidth = 2.dp,
+                )
+                candles.isNotEmpty() -> CandleChart(
+                    candles,
+                    Modifier.fillMaxSize().padding(vertical = 3.dp),
+                )
+                else -> Text(
+                    chartError ?: streamError ?: "Котировки пока недоступны",
+                    color = if (chartError != null || streamError != null) Rose else Muted,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(candles.firstOrNull()?.timestamp?.let(::formatTime) ?: "—", color = Muted, fontSize = 9.sp)
+            Text(
+                candles.getOrNull(candles.size / 2)?.timestamp?.let(::formatTime) ?: "ВРЕМЯ",
+                color = Muted,
+                fontSize = 9.sp,
+            )
+            Text(candles.lastOrNull()?.timestamp?.let(::formatTime) ?: "—", color = Muted, fontSize = 9.sp)
+            TextButtonLikeTimeframe(intervalSeconds, onInterval)
+        }
+    }
+}
+
+@Composable
+private fun TextButtonLikeTimeframe(intervalSeconds: Int, onInterval: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        Text(
+            formatChartInterval(intervalSeconds),
+            Modifier.clickable { expanded = true },
+            color = Mint,
+            fontSize = 9.sp,
+        )
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            ChartIntervals.forEach { interval ->
+                DropdownMenuItem(
+                    text = { Text(formatChartInterval(interval)) },
+                    onClick = { onInterval(interval); expanded = false },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    hasSavedApiKey: Boolean,
+    keyStatus: String?,
+    keyCheckSucceeded: Boolean?,
+    busy: Boolean,
+    onSaveKey: (String) -> Unit,
+    onCheckConnection: () -> Unit,
+    onDeleteKey: () -> Unit,
+    onTesting: () -> Unit,
+) {
+    var enteredKey by remember { mutableStateOf("") }
+    Column(
+        Modifier.fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text("НАСТРОЙКИ", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Black)
+        Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(18.dp)) {
+            Column(
+                Modifier.fillMaxWidth().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    "ИСТОЧНИКИ ДАННЫХ И API-КЛЮЧИ",
+                    color = Mint,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                SelectionMenu(
+                    label = "ИСТОЧНИК КОТИРОВОК",
+                    value = "Twelve Data",
+                    items = listOf("Twelve Data"),
+                    onSelected = {},
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = true,
+                )
+                if (hasSavedApiKey) {
+                    Text("СОХРАНЁННЫЙ КЛЮЧ: ••••••••••••", color = Muted, fontSize = 11.sp)
+                }
+                OutlinedTextField(
+                    value = enteredKey,
+                    onValueChange = { enteredKey = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Twelve Data API Key") },
+                    placeholder = { Text("Введите ключ для сохранения или замены") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    enabled = !busy,
+                )
+                Button(
+                    onClick = {
+                        val value = enteredKey.trim()
+                        onSaveKey(value)
+                        enteredKey = ""
+                    },
+                    enabled = !busy && enteredKey.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Mint, contentColor = Ink),
+                ) {
+                    Text("СОХРАНИТЬ КЛЮЧ", fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = onCheckConnection,
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (busy) "ПРОВЕРКА…" else "ПРОВЕРИТЬ ПОДКЛЮЧЕНИЕ")
+                }
+                if (hasSavedApiKey) {
+                    OutlinedButton(
+                        onClick = onDeleteKey,
+                        enabled = !busy,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Rose),
+                    ) {
+                        Text("УДАЛИТЬ СОХРАНЁННЫЙ КЛЮЧ")
+                    }
+                }
+                if (keyStatus != null) {
+                    Text(
+                        keyStatus,
+                        color = when (keyCheckSucceeded) {
+                            true -> Mint
+                            false -> Rose
+                            null -> Muted
+                        },
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                    )
+                }
+                Text(
+                    "Ключ шифруется Android Keystore на устройстве и передаётся backend только по HTTPS. Он не сохраняется на сервере.",
+                    color = Muted,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                )
+            }
+        }
+        OutlinedButton(onClick = onTesting, modifier = Modifier.fillMaxWidth()) {
+            Text("РЕЖИМ ТЕСТИРОВАНИЯ И ИСТОРИИ")
+        }
     }
 }
 
@@ -1806,9 +2253,9 @@ private fun AnalysisScreen(
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
                         when (current.direction) {
-                            "UP" -> "UP  •  ${current.probabilityUp?.let { "%.1f%%".format(Locale.US, it) } ?: "—"}"
-                            "DOWN" -> "DOWN  •  ${current.probabilityDown?.let { "%.1f%%".format(Locale.US, it) } ?: "—"}"
-                            else -> "NO SIGNAL"
+                            "UP" -> "↑ ВВЕРХ  •  ${current.probabilityUp?.let { "%.1f%%".format(Locale.US, it) } ?: "—"}"
+                            "DOWN" -> "↓ ВНИЗ  •  ${current.probabilityDown?.let { "%.1f%%".format(Locale.US, it) } ?: "—"}"
+                            else -> "НЕТ СИГНАЛА"
                         },
                         color = if (current.direction == "UP") Mint else if (current.direction == "DOWN") Rose else Gold,
                         fontWeight = FontWeight.Black,
@@ -1816,12 +2263,12 @@ private fun AnalysisScreen(
                     )
                     Text(current.explanation, color = Muted, fontSize = 12.sp, lineHeight = 17.sp)
                     Text(
-                        "Entry ${current.entryAt?.let(::formatTime) ?: "not recommended"}  •  expires ${formatTime(current.expiresAt)}",
+                        "Вход: ${current.entryAt?.let(::formatTime) ?: "не рекомендован"}  •  истекает ${formatTime(current.expiresAt)}",
                         color = Muted,
                         fontSize = 10.sp,
                     )
                     Text(
-                        "Issued ${formatTime(current.issuedAt)}  •  ${secondsToExpiry}s left  •  quote delay ${current.quoteLatency?.let { "${it} ms" } ?: "unavailable"}",
+                        "Сигнал: ${formatTime(current.issuedAt)}  •  осталось ${secondsToExpiry}с  •  задержка котировки ${current.quoteLatency?.let { "$it мс" } ?: "нет данных"}",
                         color = Muted,
                         fontSize = 10.sp,
                     )
@@ -1832,28 +2279,34 @@ private fun AnalysisScreen(
                                 enabled = !busy,
                                 modifier = Modifier.weight(1f),
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF158B68)),
-                            ) { Text("WON") }
+                            ) { Text("ПОБЕДА", fontSize = 10.sp) }
                             Button(
                                 onClick = { onOutcome("LOST") },
                                 enabled = !busy,
                                 modifier = Modifier.weight(1f),
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB63F57)),
-                            ) { Text("LOST") }
+                            ) { Text("ПОРАЖ.", fontSize = 10.sp) }
+                            Button(
+                                onClick = { onOutcome("DRAW") },
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF92783B)),
+                            ) { Text("НИЧЬЯ", fontSize = 10.sp) }
                             OutlinedButton(
                                 onClick = { onOutcome("MISSED") },
                                 enabled = !busy,
                                 modifier = Modifier.weight(1f),
-                            ) { Text("SKIP") }
+                            ) { Text("ПРОПУСК", fontSize = 10.sp) }
                         }
                     } else {
-                        Text("No trade to score. NO SIGNAL is excluded from trade accuracy.", color = Gold, fontSize = 11.sp)
+                        Text("NO SIGNAL не учитывается в результатах сделок.", color = Gold, fontSize = 11.sp)
                         Button(
                             onClick = onReanalyze,
                             enabled = !busy,
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25364B)),
                         ) {
-                            Text(if (busy) "ANALYZING…" else "ANALYZE AGAIN")
+                            Text(if (busy) "АНАЛИЗ…" else "ПОВТОРИТЬ АНАЛИЗ")
                         }
                     }
                 }
@@ -1908,12 +2361,12 @@ private fun CandleChart(candles: List<Candle>, modifier: Modifier = Modifier) {
 private fun HistoryScreen(records: List<TradeRecord>, onBack: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(18.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text("BACK") }
+            OutlinedButton(onClick = onBack) { Text("НАЗАД") }
             Spacer(Modifier.width(12.dp))
-            Text("SIGNAL HISTORY", fontWeight = FontWeight.Black, fontSize = 18.sp)
+            Text("ИСТОРИЯ СИГНАЛОВ", fontWeight = FontWeight.Black, fontSize = 18.sp)
         }
         Spacer(Modifier.height(12.dp))
-        if (records.isEmpty()) Text("No saved signals yet.", color = Muted)
+        if (records.isEmpty()) Text("Сохранённых сигналов пока нет.", color = Muted)
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(records, key = { it.id }) { record ->
                 Card(colors = CardDefaults.cardColors(containerColor = Panel)) {
@@ -1923,11 +2376,33 @@ private fun HistoryScreen(records: List<TradeRecord>, onBack: () -> Unit) {
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text("${record.symbol}  •  ${record.marketType}", fontWeight = FontWeight.Bold)
-                            Text("${formatTime(record.issuedAt)}  •  ${formatExpiry(record.expiry)}", color = Muted, fontSize = 11.sp)
+                            Text(
+                                "${formatTime(record.issuedAt)}  •  экспирация ${formatExpiry(record.expiry)}",
+                                color = Muted,
+                                fontSize = 11.sp,
+                            )
                         }
                         Column(horizontalAlignment = Alignment.End) {
-                            Text(record.direction, color = if (record.direction == "UP") Mint else if (record.direction == "DOWN") Rose else Gold)
-                            Text(record.outcome, color = Muted, fontSize = 10.sp)
+                            Text(
+                                when (record.direction) {
+                                    "UP" -> "ВВЕРХ"
+                                    "DOWN" -> "ВНИЗ"
+                                    else -> "НЕТ СИГНАЛА"
+                                },
+                                color = if (record.direction == "UP") Mint
+                                    else if (record.direction == "DOWN") Rose else Gold,
+                            )
+                            Text(
+                                when (record.outcome) {
+                                    "WON" -> "ПОБЕДА"
+                                    "LOST" -> "ПОРАЖЕНИЕ"
+                                    "DRAW" -> "НИЧЬЯ"
+                                    "MISSED" -> "ПРОПУСК"
+                                    else -> "В ОЖИДАНИИ"
+                                },
+                                color = Muted,
+                                fontSize = 10.sp,
+                            )
                         }
                     }
                 }
@@ -1945,9 +2420,9 @@ private fun StatisticsScreen(
 ) {
     Column(Modifier.fillMaxSize().padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = onBack) { Text("BACK") }
+            OutlinedButton(onClick = onBack) { Text("НАЗАД") }
             Spacer(Modifier.width(12.dp))
-            Text("STATISTICS", fontWeight = FontWeight.Black, fontSize = 18.sp)
+            Text("СТАТИСТИКА", fontWeight = FontWeight.Black, fontSize = 18.sp)
         }
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             listOf("hour", "day", "week", "all").forEach { item ->
@@ -1956,20 +2431,32 @@ private fun StatisticsScreen(
                     colors = ButtonDefaults.outlinedButtonColors(
                         contentColor = if (period == item) Mint else Muted,
                     ),
-                ) { Text(item.uppercase(Locale.US), fontSize = 10.sp) }
+                ) {
+                    Text(
+                        when (item) {
+                            "hour" -> "ЧАС"
+                            "day" -> "ДЕНЬ"
+                            "week" -> "НЕДЕЛЯ"
+                            else -> "ВСЁ"
+                        },
+                        fontSize = 10.sp,
+                    )
+                }
             }
         }
         if (stats == null) {
             CircularProgressIndicator(color = Mint)
         } else {
-            StatCard("SIGNALS", stats.total.toString())
-            StatCard("WINS / LOSSES", "${stats.wins} / ${stats.losses}")
-            StatCard("WIN RATE", stats.winRate?.let { "%.2f%%".format(Locale.US, it) } ?: "—")
-            StatCard("MISSED / PENDING", "${stats.missed} / ${stats.pending}")
-            StatCard("SESSION DURATION", stats.durationMs?.let(::formatDuration) ?: "All sessions")
-            GroupSection("BY INSTRUMENT", stats.byPair)
-            GroupSection("BY EXPIRATION (SECONDS)", stats.byExpiry)
-            GroupSection("BY MARKET", stats.byMarket)
+            StatCard("СИГНАЛЫ", stats.total.toString())
+            StatCard("ПОБЕДЫ", stats.wins.toString())
+            StatCard("ПОРАЖЕНИЯ", stats.losses.toString())
+            StatCard("НИЧЬИ", stats.draws.toString())
+            StatCard("УСПЕШНОСТЬ", stats.winRate?.let { "%.2f%%".format(Locale.US, it) } ?: "—")
+            StatCard("ПРОПУСКИ / ОЖИДАЮТ", "${stats.missed} / ${stats.pending}")
+            StatCard("ДЛИТЕЛЬНОСТЬ СЕССИИ", stats.durationMs?.let(::formatDuration) ?: "Все сессии")
+            GroupSection("ПО ВАЛЮТНОЙ ПАРЕ", stats.byPair)
+            GroupSection("ПО ЭКСПИРАЦИИ (СЕКУНДЫ)", stats.byExpiry)
+            GroupSection("ПО РЫНКУ", stats.byMarket)
         }
     }
 }
@@ -1978,12 +2465,13 @@ private fun StatisticsScreen(
 private fun GroupSection(title: String, groups: Map<String, GroupStats>) {
     Text(title, color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     if (groups.isEmpty()) {
-        Text("No results for this range.", color = Muted, fontSize = 11.sp)
+        Text("За этот период данных нет.", color = Muted, fontSize = 11.sp)
     } else {
         groups.toSortedMap().forEach { (name, value) ->
             StatCard(
                 name,
-                "${value.total} trades  •  ${value.wins}W / ${value.losses}L / ${value.missed} skipped",
+                "${value.total} всего  •  ${value.wins} побед / ${value.losses} пораж. / " +
+                    "${value.draws} ничьих / ${value.missed} пропусков",
             )
         }
     }

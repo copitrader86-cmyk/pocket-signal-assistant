@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Annotated, Iterator
 
 import websockets
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field
 
 from app.analytics import analyze_candles
@@ -569,7 +577,7 @@ class AnalysisResponse(BaseModel):
 
 
 class OutcomeRequest(BaseModel):
-    outcome: str = Field(pattern="^(WON|LOST|MISSED)$")
+    outcome: str = Field(pattern="^(WON|LOST|MISSED|DRAW)$")
 
 
 class SessionRequest(BaseModel):
@@ -579,13 +587,25 @@ class SessionRequest(BaseModel):
 def _provider_http_error(error: MarketDataError) -> HTTPException:
     if "not configured" in str(error):
         return HTTPException(status_code=503, detail=str(error))
+    if error.status_code in {401, 403}:
+        return HTTPException(
+            status_code=401,
+            detail="Twelve Data rejected the API key or denied this request",
+        )
     if error.status_code == 429:
         return HTTPException(status_code=429, detail="Twelve Data rate limit exceeded")
     return HTTPException(status_code=502, detail=f"Market-data provider error: {error}")
 
 
-async def _refresh_twelvedata_catalog(database_path: Path) -> int:
-    async with TwelveDataClient() as provider:
+async def _refresh_twelvedata_catalog(
+    database_path: Path, *, api_key: str | None = None
+) -> int:
+    provider_client = (
+        TwelveDataClient(api_key=api_key)
+        if api_key is not None
+        else TwelveDataClient()
+    )
+    async with provider_client as provider:
         instruments = await provider.forex_pairs()
     if not instruments:
         raise MarketDataError("Twelve Data returned an empty Forex catalog")
@@ -974,6 +994,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
     def source_status(
         connection: Annotated[sqlite3.Connection, Depends(get_connection)],
         symbol: str | None = Query(default=None, min_length=1, max_length=24),
+        api_key: Annotated[str | None, Header(alias="X-Twelve-Data-Api-Key")] = None,
     ) -> dict[str, object]:
         now_ms = int(time.time() * 1000)
         try:
@@ -993,7 +1014,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             """,
             online_parameters,
         ).fetchone()
-        key_configured = has_twelve_data_api_key()
+        key_configured = has_twelve_data_api_key(api_key) or has_twelve_data_api_key()
         age_ms = (
             max(0, now_ms - latest_tick["timestamp_ms"])
             if latest_tick is not None
@@ -1191,10 +1212,12 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         }
 
     @application.post("/api/v1/provider/twelvedata/catalog")
-    async def refresh_twelvedata_catalog() -> dict[str, int | str]:
+    async def refresh_twelvedata_catalog(
+        api_key: Annotated[str | None, Header(alias="X-Twelve-Data-Api-Key")] = None,
+    ) -> dict[str, int | str]:
         try:
             instruments_updated = await _refresh_twelvedata_catalog(
-                resolved_database_path
+                resolved_database_path, api_key=api_key
             )
         except MarketDataError as error:
             raise _provider_http_error(error) from error
@@ -1204,6 +1227,26 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             ) from error
         return {
             "provider": PROVIDER_NAME,
+            "instruments_updated": instruments_updated,
+        }
+
+    @application.post("/api/v1/provider/twelvedata/check")
+    async def check_twelvedata_connection(
+        api_key: Annotated[str | None, Header(alias="X-Twelve-Data-Api-Key")] = None,
+    ) -> dict[str, int | str]:
+        try:
+            instruments_updated = await _refresh_twelvedata_catalog(
+                resolved_database_path, api_key=api_key
+            )
+        except MarketDataError as error:
+            raise _provider_http_error(error) from error
+        except sqlite3.Error as error:
+            raise HTTPException(
+                status_code=503, detail="Could not save the Twelve Data catalog"
+            ) from error
+        return {
+            "provider": PROVIDER_NAME,
+            "status": "connected",
             "instruments_updated": instruments_updated,
         }
 
@@ -1270,12 +1313,13 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         symbol: str = Query(min_length=1, max_length=24),
         interval_seconds: int = Query(ge=60, le=86400),
         outputsize: int = Query(default=500, ge=1, le=5000),
+        api_key: Annotated[str | None, Header(alias="X-Twelve-Data-Api-Key")] = None,
     ) -> dict[str, int | str]:
         try:
             normalized_symbol = normalize_symbol(symbol)
             if interval_seconds not in INTERVALS_BY_SECONDS:
                 raise ValueError("Unsupported Twelve Data historical interval")
-            async with TwelveDataClient() as provider:
+            async with TwelveDataClient(api_key=api_key) as provider:
                 history = await provider.time_series(
                     normalized_symbol, interval_seconds, outputsize
                 )
@@ -1371,7 +1415,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         connection: Annotated[sqlite3.Connection, Depends(get_connection)],
         session_id: str | None = None,
         outcome: str | None = Query(
-            default=None, pattern="^(PENDING|WON|LOST|MISSED)$"
+            default=None, pattern="^(PENDING|WON|LOST|MISSED|DRAW)$"
         ),
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> list[dict[str, object]]:
@@ -1460,7 +1504,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             """,
             parameters,
         ).fetchall()
-        total = won = lost = missed = 0
+        total = won = lost = missed = drawn = 0
         by_pair: dict[str, dict[str, int]] = {}
         by_expiry: dict[str, dict[str, int]] = {}
         by_market: dict[str, dict[str, int]] = {}
@@ -1471,14 +1515,18 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             won += count if outcome == "WON" else 0
             lost += count if outcome == "LOST" else 0
             missed += count if outcome == "MISSED" else 0
+            drawn += count if outcome == "DRAW" else 0
             for bucket, key in (
                 (by_pair, row["symbol"]),
                 (by_expiry, str(row["expiry_seconds"])),
                 (by_market, row["market_type"]),
             ):
-                group = bucket.setdefault(key, {"total": 0, "won": 0, "lost": 0, "missed": 0})
+                group = bucket.setdefault(
+                    key,
+                    {"total": 0, "won": 0, "lost": 0, "draw": 0, "missed": 0},
+                )
                 group["total"] += count
-                if outcome in ("WON", "LOST", "MISSED"):
+                if outcome in ("WON", "LOST", "DRAW", "MISSED"):
                     group[outcome.lower()] += count
         decided = won + lost
         session_duration_ms: int | None = None
@@ -1501,8 +1549,9 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             "total_signals": total,
             "wins": won,
             "losses": lost,
+            "draws": drawn,
             "missed": missed,
-            "pending": total - won - lost - missed,
+            "pending": total - won - lost - drawn - missed,
             "win_rate_percent": round(won * 100 / decided, 2) if decided else None,
             "by_pair": by_pair,
             "by_expiry_seconds": by_expiry,
@@ -2226,7 +2275,12 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             await websocket.close(code=1008)
             return
 
-        api_key = os.getenv("TWELVE_DATA_API_KEY")
+        requested_api_key = websocket.headers.get("x-twelve-data-api-key")
+        api_key = (
+            requested_api_key.strip()
+            if requested_api_key and has_twelve_data_api_key(requested_api_key)
+            else os.getenv("TWELVE_DATA_API_KEY")
+        )
         if not has_twelve_data_api_key(api_key):
             await websocket.send_json(
                 {"error": "Live stream is unavailable: TWELVE_DATA_API_KEY is not configured"}
