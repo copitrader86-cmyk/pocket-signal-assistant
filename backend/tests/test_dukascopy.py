@@ -596,7 +596,7 @@ def test_dukascopy_backtest_api_reads_saved_history_and_returns_expiry_results(
             "/api/v1/backtest/dukascopy",
             params=[
                 ("symbol", "EUR/USD"),
-                ("period_days", 1),
+                ("period_days", 2),
                 ("expiry_seconds", 60),
                 ("expiry_seconds", 300),
                 ("expiry_seconds", 900),
