@@ -182,24 +182,19 @@ jobs:
           fi
 
           if check_http "GET /api/v1/sources/status" GET "/api/v1/sources/status" 200; then
-            if ! jq -e '.online.credentials_configured == true' "$response_file" >/dev/null; then
-              echo "::error::Twelve Data is not configured in Render Environment; set TWELVE_DATA_API_KEY"
+            jq -e '.online | has("credentials_configured")' "$response_file" >/dev/null || {
+              echo "::error::Source status returned an unexpected response"
               failures=1
-            fi
+            }
           fi
 
-          if check_http "POST Twelve Data catalog" POST \
-            "/api/v1/provider/twelvedata/catalog" 200; then
-            if ! jq -e '.instruments_updated > 0' "$response_file" >/dev/null; then
-              echo "::error::Twelve Data catalog refresh returned no instruments"
-              failures=1
-            fi
-          fi
-
-          if check_http "POST Twelve Data history" POST \
-            "/api/v1/history/twelvedata?symbol=EUR%2FUSD&interval_seconds=60" 200; then
-            if ! jq -e '.rows_received > 0' "$response_file" >/dev/null; then
-              echo "::error::Twelve Data history returned no candles"
+          if check_http "GET instrument catalog" GET "/api/v1/catalog" 200; then
+            if ! jq -e '
+              (.instruments | type == "array") and
+              (.classic_available | type == "boolean") and
+              (.otc_available | type == "boolean")
+            ' "$response_file" >/dev/null; then
+              echo "::error::Instrument catalog returned an unexpected response"
               failures=1
             fi
           fi

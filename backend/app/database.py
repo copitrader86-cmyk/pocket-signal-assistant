@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA = (
     """
@@ -40,6 +40,11 @@ _SCHEMA = (
     """
     CREATE INDEX candles_lookup
     ON candles (provider, symbol, interval_seconds, timestamp_ms)
+    """,
+    """
+    CREATE INDEX candles_historical_lookup
+    ON candles (provider, market_type, symbol, timestamp_ms)
+    WHERE data_kind = 'HISTORICAL'
     """,
     """
     CREATE TABLE trading_sessions (
@@ -466,6 +471,16 @@ def initialize_database(database_path: Path) -> None:
                 )
                 current_version = 10
                 connection.execute("PRAGMA user_version = 10")
+            if current_version == 10:
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS candles_historical_lookup
+                    ON candles (provider, market_type, symbol, timestamp_ms)
+                    WHERE data_kind = 'HISTORICAL'
+                    """
+                )
+                current_version = 11
+                connection.execute("PRAGMA user_version = 11")
             connection.commit()
         except Exception:
             connection.rollback()
