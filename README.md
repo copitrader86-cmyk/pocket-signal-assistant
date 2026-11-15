@@ -40,12 +40,16 @@ disk or paid plan. `DATABASE_PATH` points to
 non-root application user, and the backend initializes a new SQLite database
 and schema at startup if none exists.
 
-Set `TWELVE_DATA_API_KEY` in the existing Render web service's Environment
-settings. The Blueprint declares it as a secret prompt
-(`sync: false`); its value is not stored in this repository. After saving the
-environment variable, Render restarts the service, which refreshes the
-Twelve Data Forex catalog at startup. Do not put the key in `render.yaml`,
-the Android app, or source control. Enter it only in the Render dashboard.
+The backend operator may set `TWELVE_DATA_API_KEY` in the existing Render web
+service's Environment settings as a server-wide fallback. The Blueprint
+declares it as a secret prompt (`sync: false`); its value is not stored in this
+repository. After saving the environment variable, Render restarts the service
+and refreshes the Twelve Data Forex catalog. Android users can instead enter,
+replace, verify, and delete their own key in **Settings → Data Sources and API
+Keys**. The app encrypts that key with Android Keystore and sends it to the
+backend only in an HTTPS header for Twelve Data requests; the backend does not
+persist or log the per-device key. Never put a real key in source control or
+the APK.
 
 For automated Render deployments from GitHub, add two secret values in the
 repository settings: `RENDER_API_KEY` (Render API key) and
@@ -100,11 +104,13 @@ Build a debug APK with an installed Android SDK and JDK 17+:
 ./gradlew assembleDebug
 ```
 
-The APK is written to `app/build/outputs/apk/debug/app-debug.apk`. The current
-client includes instrument/market/expiry selection, analysis, live tick chart,
-session controls, results, history, and statistics. OTC selection remains
-disabled by the server's data-source policy unless a real authorized OTC feed
-is implemented.
+The APK is written to `app/build/outputs/apk/debug/app-debug.apk`. The client
+includes instrument/market/expiry/timeframe selection, a live/historical
+candlestick chart, signal analysis, sessions, results, history, statistics,
+and device-encrypted Twelve Data key settings. The connection check refreshes
+the real Twelve Data Forex catalog; the key is not stored on the backend. OTC
+selection remains unavailable under the server's data-source policy unless a
+real authorized OTC feed is implemented.
 
 The Android Actions workflow builds and uploads the `PocketSignal-debug-apk`
 artifact on pushes to `main` and manual `workflow_dispatch` runs. It also runs
@@ -113,15 +119,19 @@ release APK when release-signing secrets are configured.
 
 ## Market data and API
 
-The existing Twelve Data adapter requires an API key configured by the backend
-operator; no provider key is embedded in the Android app or required from its
-users. Twelve Data currently lists a no-cost Basic tier with real-time Forex,
+The existing Twelve Data adapter requires an API key, supplied either by the
+backend operator or by an Android user in the app's encrypted settings. No
+provider key is embedded in the APK. Twelve Data currently lists a no-cost Basic tier with real-time Forex,
 8 API credits per minute (800 per day), and 8 trial WebSocket credits. This
 still requires an account/API key, is quota-limited, and availability and
 permitted use are governed by the provider's terms. Without a configured key,
 the adapter stays unavailable and the app must not produce directional signals.
 The backend refreshes its Forex catalog at startup and operators can also
-trigger a refresh with `POST /api/v1/provider/twelvedata/catalog`. Historical
+trigger a refresh with `POST /api/v1/provider/twelvedata/catalog`. The app's
+`POST /api/v1/provider/twelvedata/check` endpoint validates the supplied key by
+retrieving the real provider catalog. Per-device keys are sent in the
+`X-Twelve-Data-Api-Key` HTTPS header and are neither stored nor logged by the
+backend. Historical
 OHLC candles are available for supported intervals through
 `POST /api/v1/history/twelvedata?symbol=EUR%2FUSD&interval_seconds=60`; the
 Android Market Chart screen requests them for the selected pair and timeframe.
@@ -239,8 +249,8 @@ not interpolated. Historical and live candles are stored and queried separately.
 fresh, the observed stream rate is adequate, the technical candidate is strong,
 and an active model has passed temporal validation. Otherwise it records and
 returns `NO_SIGNAL`, with no invented probabilities. ONLINE uses the existing
-Twelve Data WebSocket only when the backend operator supplies its provider API
-key. There is no verified public keyless Forex source with a trading-grade
+Twelve Data WebSocket with the operator's configured key or the app user's
+per-device key. There is no verified public keyless Forex source with a trading-grade
 update frequency; the daily reference-rate source is never used as a live-feed
 fallback. `/api/v1/sources/status` reports the latest quote and why ONLINE is
 unavailable.

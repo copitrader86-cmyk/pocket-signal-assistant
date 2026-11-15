@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA = (
     """
@@ -81,7 +81,7 @@ _SCHEMA = (
         explanation TEXT NOT NULL,
         model_version_id TEXT REFERENCES model_versions (id),
         outcome TEXT NOT NULL DEFAULT 'PENDING'
-            CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED')),
+            CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED', 'DRAW')),
         outcome_recorded_at_ms INTEGER,
         CHECK (
             (probability_up IS NULL AND probability_down IS NULL)
@@ -178,7 +178,7 @@ def initialize_database(database_path: Path) -> None:
                         explanation TEXT NOT NULL,
                         model_version_id TEXT REFERENCES model_versions (id),
                         outcome TEXT NOT NULL DEFAULT 'PENDING'
-                            CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED')),
+                            CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED', 'DRAW')),
                         outcome_recorded_at_ms INTEGER,
                         CHECK (
                             (probability_up IS NULL AND probability_down IS NULL)
@@ -279,7 +279,7 @@ def initialize_database(database_path: Path) -> None:
                     explanation TEXT NOT NULL,
                     model_version_id TEXT REFERENCES model_versions (id),
                     outcome TEXT NOT NULL DEFAULT 'PENDING'
-                        CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED')),
+                        CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED', 'DRAW')),
                     outcome_recorded_at_ms INTEGER,
                     CHECK (
                         (probability_up IS NULL AND probability_down IS NULL)
@@ -399,6 +399,73 @@ def initialize_database(database_path: Path) -> None:
                 )
                 current_version = 9
                 connection.execute("PRAGMA user_version = 9")
+            if current_version == 9:
+                connection.execute("ALTER TABLE signals RENAME TO signals_old")
+                connection.execute(
+                    """
+                    CREATE TABLE signals_new (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT REFERENCES trading_sessions (id),
+                        provider TEXT NOT NULL,
+                        market_type TEXT NOT NULL CHECK (market_type IN ('CLASSIC', 'OTC')),
+                        symbol TEXT NOT NULL,
+                        direction TEXT NOT NULL CHECK (
+                            direction IN ('UP', 'DOWN', 'NO_SIGNAL')
+                        ),
+                        expiry_seconds INTEGER NOT NULL CHECK (
+                            expiry_seconds IN (
+                                3, 5, 10, 15, 20, 25, 30, 60, 120, 180,
+                                240, 300, 600, 900
+                            )
+                        ),
+                        issued_at_ms INTEGER NOT NULL,
+                        recommended_entry_at_ms INTEGER,
+                        expires_at_ms INTEGER NOT NULL,
+                        quote_timestamp_ms INTEGER,
+                        quote_latency_ms INTEGER
+                            CHECK (quote_latency_ms IS NULL OR quote_latency_ms >= 0),
+                        probability_up REAL
+                            CHECK (probability_up IS NULL OR probability_up BETWEEN 0 AND 100),
+                        probability_down REAL
+                            CHECK (probability_down IS NULL OR probability_down BETWEEN 0 AND 100),
+                        market_snapshot_json TEXT NOT NULL
+                            CHECK (json_valid(market_snapshot_json)),
+                        analytics_json TEXT NOT NULL CHECK (json_valid(analytics_json)),
+                        explanation TEXT NOT NULL,
+                        model_version_id TEXT REFERENCES model_versions (id),
+                        outcome TEXT NOT NULL DEFAULT 'PENDING'
+                            CHECK (outcome IN ('PENDING', 'WON', 'LOST', 'MISSED', 'DRAW')),
+                        outcome_recorded_at_ms INTEGER,
+                        CHECK (
+                            (probability_up IS NULL AND probability_down IS NULL)
+                            OR (probability_up IS NOT NULL AND probability_down IS NOT NULL)
+                        )
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO signals_new
+                    SELECT id, session_id, provider, market_type, symbol, direction,
+                        expiry_seconds, issued_at_ms, recommended_entry_at_ms,
+                        expires_at_ms, quote_timestamp_ms, quote_latency_ms,
+                        probability_up, probability_down, market_snapshot_json,
+                        analytics_json, explanation, model_version_id, outcome,
+                        outcome_recorded_at_ms
+                    FROM signals_old
+                    """
+                )
+                connection.execute("DROP TABLE signals_old")
+                connection.execute("ALTER TABLE signals_new RENAME TO signals")
+                connection.execute(
+                    "CREATE INDEX signals_history ON signals (issued_at_ms DESC)"
+                )
+                connection.execute(
+                    "CREATE INDEX signals_session_history "
+                    "ON signals (session_id, issued_at_ms DESC)"
+                )
+                current_version = 10
+                connection.execute("PRAGMA user_version = 10")
             connection.commit()
         except Exception:
             connection.rollback()

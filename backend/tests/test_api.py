@@ -90,7 +90,7 @@ def test_schema_upgrade_preserves_signals(tmp_path: Path) -> None:
             "SELECT id, quote_timestamp_ms FROM signals WHERE id = 'keep-me'"
         ).fetchone()
 
-    assert version == 9
+    assert version == 10
     assert tuple(signal) == ("keep-me", None)
 
 
@@ -285,6 +285,23 @@ def test_twelvedata_status_reports_configured_key_without_returning_it(
     assert secret not in response.text
 
 
+def test_twelvedata_status_accepts_device_key_without_returning_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "device-only-test-secret"
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
+
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.get(
+            "/api/v1/sources/status",
+            headers={"X-Twelve-Data-Api-Key": secret},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["online"]["credentials_configured"] is True
+    assert secret not in response.text
+
+
 def test_twelvedata_websocket_stream_persists_provider_quotes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -299,7 +316,7 @@ def test_twelvedata_websocket_stream_persists_provider_quotes(
             """
         )
     api_key = "websocket-test-secret"
-    monkeypatch.setenv("TWELVE_DATA_API_KEY", api_key)
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
 
     class FakeUpstream:
         def __init__(self) -> None:
@@ -337,7 +354,10 @@ def test_twelvedata_websocket_stream_persists_provider_quotes(
 
     monkeypatch.setattr("app.main.websockets.connect", fake_connect)
     with TestClient(create_app(database_path)) as client:
-        with client.websocket_connect("/api/v1/stream?symbol=EUR%2FUSD") as socket:
+        with client.websocket_connect(
+            "/api/v1/stream?symbol=EUR%2FUSD",
+            headers={"X-Twelve-Data-Api-Key": api_key},
+        ) as socket:
             tick = socket.receive_json()
         candles = client.get(
             "/api/v1/candles",
@@ -358,6 +378,9 @@ def test_twelvedata_catalog_refresh_saves_provider_instruments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FakeTwelveDataClient:
+        def __init__(self, api_key: str | None = None) -> None:
+            assert api_key is None
+
         async def __aenter__(self) -> "FakeTwelveDataClient":
             return self
 
@@ -391,10 +414,57 @@ def test_twelvedata_catalog_refresh_saves_provider_instruments(
     ]
 
 
+def test_twelvedata_connection_check_uses_device_key_and_refreshes_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "device-only-test-secret"
+
+    class FakeTwelveDataClient:
+        def __init__(self, api_key: str | None = None) -> None:
+            assert api_key == secret
+
+        async def __aenter__(self) -> "FakeTwelveDataClient":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def forex_pairs(self) -> list[dict[str, str]]:
+            return [
+                {
+                    "provider": "TwelveData",
+                    "market_type": "CLASSIC",
+                    "symbol": "EUR/USD",
+                    "display_name": "EUR/USD",
+                }
+            ]
+
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
+    monkeypatch.setattr("app.main.TwelveDataClient", FakeTwelveDataClient)
+    with TestClient(create_app(tmp_path / "signals.db")) as client:
+        response = client.post(
+            "/api/v1/provider/twelvedata/check",
+            headers={"X-Twelve-Data-Api-Key": secret},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider": "TwelveData",
+        "status": "connected",
+        "instruments_updated": 1,
+    }
+    assert secret not in response.text
+
+
 def test_twelvedata_history_api_persists_provider_candles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    secret = "history-test-secret"
+
     class FakeTwelveDataClient:
+        def __init__(self, api_key: str | None = None) -> None:
+            assert api_key == secret
+
         async def __aenter__(self) -> "FakeTwelveDataClient":
             return self
 
@@ -415,11 +485,13 @@ def test_twelvedata_history_api_persists_provider_candles(
                 )
             ]
 
+    monkeypatch.delenv("TWELVE_DATA_API_KEY", raising=False)
     monkeypatch.setattr("app.main.TwelveDataClient", FakeTwelveDataClient)
     with TestClient(create_app(tmp_path / "signals.db")) as client:
         response = client.post(
             "/api/v1/history/twelvedata",
             params={"symbol": "EUR/USD", "interval_seconds": 60, "outputsize": 1},
+            headers={"X-Twelve-Data-Api-Key": secret},
         )
 
     assert response.status_code == 200
@@ -563,6 +635,7 @@ def test_session_and_statistics_track_wins_losses_and_missed_signals(
         for signal_id, outcome in (
             ("signal-won", "WON"),
             ("signal-lost", "LOST"),
+            ("signal-draw", "DRAW"),
             ("signal-missed", "MISSED"),
             ("signal-open", "PENDING"),
         ):
@@ -588,14 +661,16 @@ def test_session_and_statistics_track_wins_losses_and_missed_signals(
             params={"session_id": "session-1", "limit": 10},
         ).json()
 
-    assert summary["total_signals"] == 4
+    assert summary["total_signals"] == 5
     assert summary["wins"] == 1
     assert summary["losses"] == 1
+    assert summary["draws"] == 1
     assert summary["missed"] == 1
     assert summary["pending"] == 1
     assert summary["win_rate_percent"] == 50
-    assert summary["by_pair"]["EUR/USD"]["total"] == 4
-    assert len(history) == 4
+    assert summary["by_pair"]["EUR/USD"]["total"] == 5
+    assert summary["by_pair"]["EUR/USD"]["draw"] == 1
+    assert len(history) == 5
 
 
 def test_technical_analysis_is_deterministic_and_requires_warmup() -> None:
